@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block content %}
+{% set current_tab = 'runs' %}
+{% include "_analysis_tabs.html" %}
+<div class="panel">
+  <h2>6) Model Runs Summary (Analysis {{ analysis.id }})</h2>
+  <div class="card-grid">
+    <div class="card"><div class="muted">Total</div><div>{{ counts.total }}</div></div>
+    <div class="card"><div class="muted">Valid</div><div>{{ counts.valid }}</div></div>
+    <div class="card"><div class="muted">Invalid</div><div>{{ counts.invalid }}</div></div>
+    <div class="card"><div class="muted">Valid + Robust</div><div>{{ counts.valid_with_robust_se }}</div></div>
+  </div>
+  <p>
+    Filter:
+    <a href="{{ url_for('sme.model_runs_summary', analysis_id=analysis.id) }}">All</a> |
+    <a href="{{ url_for('sme.model_runs_summary', analysis_id=analysis.id, validity='invalid') }}">Invalid</a> |
+    <a href="{{ url_for('sme.model_runs_summary', analysis_id=analysis.id, validity='valid') }}">Valid</a> |
+    <a href="{{ url_for('sme.model_runs_summary', analysis_id=analysis.id, validity='valid_with_robust_se') }}">Valid+Robust</a>
+  </p>
+  <p>
+    <a href="{{ url_for('sme.stability_dashboard', analysis_id=analysis.id) }}">Stability dashboard</a> |
+    <a href="{{ url_for('sme.report_export', analysis_id=analysis.id) }}">Report export</a>
+  </p>
+</div>
+
+<div class="panel">
+  <table>
+    <tr>
+      <th>#</th><th>Class</th><th>Status</th><th>Validity</th><th>n</th><th>R2</th><th>Max VIF</th><th>BP p</th><th>High Cook Count</th><th>Failures</th><th>Warnings</th><th>Formula</th>
+    </tr>
+    {% for r in runs %}
+      <tr>
+        <td>{{ r.model_idx }}</td>
+        <td>{{ r.model_class }}</td>
+        <td>{{ r.status }}</td>
+        <td>
+          {% if r.validity_class == 'valid' %}
+            <span class="pill valid">valid</span>
+          {% elif r.validity_class == 'valid_with_robust_se' %}
+            <span class="pill robust">valid_with_robust_se</span>
+          {% else %}
+            <span class="pill invalid">invalid</span>
+          {% endif %}
+        </td>
+        <td>{{ r.n_obs }}</td>
+        <td>{{ "%.4f"|format(r.metrics.r2) if r.metrics.r2 is not none else '' }}</td>
+        <td>{{ "%.3f"|format(r.metrics.max_vif) if r.metrics.max_vif is not none else '' }}</td>
+        <td>{{ "%.4f"|format(r.metrics.bp_p) if r.metrics.bp_p is not none else '' }}</td>
+        <td>{{ r.metrics.high_cook_count }}</td>
+        <td>{{ r.invalid_reasons|join('; ') }}</td>
+        <td>{{ r.warnings|join('; ') }}</td>
+        <td class="mono">{{ r.formula }}</td>
+      </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}

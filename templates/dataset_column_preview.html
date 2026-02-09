@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="panel">
+  <div class="breadcrumb">
+    <a href="{{ url_for('sme.home') }}">Datasets</a>
+    <span class="crumb-sep">&gt;</span>
+    <a href="{{ url_for('sme.dataset_detail', dataset_id=dataset.id) }}">{{ dataset.name }}</a>
+    <span class="crumb-sep">&gt;</span>
+    <span>{{ column_name }}</span>
+  </div>
+  <h2>Variable Review: {{ column_name }}</h2>
+  <div class="purpose-banner">
+    Purpose: Review inferred role and value distribution to confirm modeling suitability.
+  </div>
+</div>
+
+<div class="panel">
+  <h3>Decision Summary</h3>
+  <div class="decision-grid">
+    <div class="decision-item"><span class="decision-label">Detected type:</span> <span class="mono">{{ preview.column.inferred_type }}</span></div>
+    <div class="decision-item">
+      <span class="decision-label">Model role:</span>
+      <span class="role-badge role-{{ preview.column.model_role }}">{{ preview.column.model_role }}</span>
+    </div>
+    <div class="decision-item"><span class="decision-label">Non-null rows:</span> {{ preview.non_null_count }} / {{ dataset.row_count }}</div>
+    <div class="decision-item"><span class="decision-label">Distinct values:</span> {{ preview.column.unique_count }}</div>
+  </div>
+  <div class="confidence-row confidence-{{ confidence_level }}">
+    {% if confidence_level == 'good' %}
+      [OK]
+    {% elif confidence_level == 'warn' %}
+      [WARN]
+    {% else %}
+      [INFO]
+    {% endif %}
+    {{ confidence_message }}
+  </div>
+
+  <form method="post" action="{{ url_for('sme.dataset_column_preview_update_role', dataset_id=dataset.id) }}" class="role-inline-form">
+    <input type="hidden" name="column_name" value="{{ column_name }}">
+    <input type="hidden" name="column_id" value="{{ preview.column.id }}">
+    <label>Model Role</label>
+    <select name="model_role" class="role-select-inline">
+      {% for role in allowed_roles %}
+        <option value="{{ role }}" {% if preview.column.model_role == role %}selected{% endif %}>{{ role }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit">Apply Role</button>
+    <div class="hint">`categorical` = factor, `continuous` = covariate, `excluded` = ID/non-model variable.</div>
+  </form>
+</div>
+
+<div class="panel">
+  <h3>Factor Levels</h3>
+  <p class="muted">Distribution of observed values (top {{ max_distinct }} by count).</p>
+  <div class="level-list">
+    {% for item in preview.distinct_values %}
+      <div class="level-row">
+        <div class="mono level-name">{{ item.value }}</div>
+        <div class="level-bar-wrap"><div class="level-bar" style="width: {{ '%.2f'|format(item.bar_pct) }}%;"></div></div>
+        <div class="level-count">{{ item.count }} ({{ '%.1f'|format(item.pct_non_null) }}%)</div>
+      </div>
+    {% endfor %}
+  </div>
+  {% if imbalance_warning %}
+    <div class="confidence-row confidence-warn">[WARN] One level exceeds 40% of observations ({{ '%.1f'|format(dominant_pct) }}%).</div>
+  {% endif %}
+  {% if preview.column.unique_count > preview.distinct_values|length %}
+    <p class="muted">
+      Showing {{ preview.distinct_values|length }} of {{ preview.column.unique_count }} values.
+      <a href="{{ url_for('sme.dataset_column_preview', dataset_id=dataset.id, column_name=column_name, max_distinct=show_more_limit, sample_rows=sample_rows) }}">Show more</a>
+      {% if max_distinct > show_less_limit %}
+        | <a href="{{ url_for('sme.dataset_column_preview', dataset_id=dataset.id, column_name=column_name, max_distinct=show_less_limit, sample_rows=sample_rows) }}">Show less</a>
+      {% endif %}
+    </p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <details>
+    <summary>Example Observations (first {{ sample_rows }} non-null)</summary>
+    <p class="muted">Example rows to verify formatting, casing, and encoding consistency.</p>
+    <table>
+      <tr><th>row_index</th><th>{{ column_name }}</th></tr>
+      {% for row in preview.sample_rows %}
+        <tr>
+          <td class="mono">{{ row.row_index }}</td>
+          <td class="mono">{{ row.value }}</td>
+        </tr>
+      {% endfor %}
+    </table>
+  </details>
+</div>
+
+<div class="panel">
+  <details>
+    <summary>Modeling Notes</summary>
+    <ul>
+      <li>This variable will be treated according to the selected model role for future analyses.</li>
+      <li>Balanced level counts support more stable adjusted means and pairwise comparisons.</li>
+      <li>Use this page to confirm level naming consistency before generating a model registry.</li>
+    </ul>
+  </details>
+</div>
+{% endblock %}

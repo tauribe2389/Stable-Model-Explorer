@@ -1,0 +1,231 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="panel">
+  <h2>2) Analysis Config Wizard (Dataset {{ dataset.id }}: {{ dataset.name }})</h2>
+  <p class="muted">Configure variable governance, outlier policy, model caps, and assumptions handling. This snapshot is persisted for reproducibility.</p>
+
+  <form method="post">
+    <div class="row3">
+      <div>
+        <label>Analysis Name</label>
+        <input type="text" name="analysis_name" value="{{ config.name or 'SME Analysis' }}">
+      </div>
+      <div>
+        <label>Load Preset</label>
+        <select onchange="if(this.value){window.location='?preset_id='+this.value;}">
+          <option value="">(none)</option>
+          {% for p in presets %}
+            <option value="{{ p.id }}">{{ p.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label>Save/Update Preset Name</label>
+        <input type="text" name="save_preset_name" placeholder="optional">
+      </div>
+    </div>
+
+    <div class="row3">
+      <div>
+        <label>Response (Y)</label>
+        <select name="response">
+          <option value="">Select response</option>
+          {% for col in response_candidates %}
+            <option value="{{ col }}" {% if config.response==col %}selected{% endif %}>{{ col }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label>Primary Factors (categorical)</label>
+        <div class="var-box">
+          {% for col in categorical %}
+            <div class="var-item" data-role="primary" data-var="{{ col }}">
+              <input type="checkbox" id="primary_{{ loop.index }}" name="primary_factors" value="{{ col }}" {% if col in config.primary_factors %}checked{% endif %}>
+              <label for="primary_{{ loop.index }}">{{ col }}</label>
+            </div>
+          {% endfor %}
+        </div>
+        <div class="hint">Multi-select by checking boxes.</div>
+      </div>
+      <div>
+        <label>Group Variables (for group health + MAD outliers)</label>
+        <div class="var-box">
+          {% for col in categorical %}
+            <div class="var-item" data-role="group" data-var="{{ col }}">
+              <input type="checkbox" id="group_{{ loop.index }}" name="group_variables" value="{{ col }}" {% if col in config.group_variables %}checked{% endif %}>
+              <label for="group_{{ loop.index }}">{{ col }}</label>
+            </div>
+          {% endfor %}
+        </div>
+        <div class="hint">Primary/group selections are reserved and removed from covariates below.</div>
+      </div>
+    </div>
+
+    <div class="row3">
+      <div>
+        <label>Categorical Covariates</label>
+        <div class="var-box">
+          {% for col in categorical %}
+            <div class="var-item" data-role="cat_cov" data-var="{{ col }}">
+              <input type="checkbox" id="cat_cov_{{ loop.index }}" name="categorical_covariates" value="{{ col }}" {% if col in config.categorical_covariates %}checked{% endif %}>
+              <label for="cat_cov_{{ loop.index }}">{{ col }}</label>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+      <div>
+        <label>Continuous Covariates</label>
+        <div class="var-box">
+          {% for col in continuous %}
+            <div class="var-item" data-role="cont_cov" data-var="{{ col }}">
+              <input type="checkbox" id="cont_cov_{{ loop.index }}" name="continuous_covariates" value="{{ col }}" {% if col in config.continuous_covariates %}checked{% endif %}>
+              <label for="cont_cov_{{ loop.index }}">{{ col }}</label>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+      <div>
+        <label>Forced Terms (always included)</label>
+        <div class="var-box">
+          {% for c in columns %}
+            {% if c.model_role != 'excluded' %}
+              <div class="var-item">
+                <input type="checkbox" id="forced_{{ loop.index }}" name="forced_terms" value="{{ c.column_name }}" {% if c.column_name in config.forced_terms %}checked{% endif %}>
+                <label for="forced_{{ loop.index }}">{{ c.column_name }}</label>
+              </div>
+            {% endif %}
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    <div class="row3">
+      <div>
+        <label>Interaction Candidates (comma-separated `A:B`)</label>
+        <textarea name="interaction_candidates">{{ (config.interaction_candidates or [])|join(', ') }}</textarea>
+      </div>
+      <div>
+        <label>Robust SE Mode</label>
+        <select name="robust_se_mode">
+          {% for mode in ['HC3','HC2','HC1','HC0','NONE'] %}
+            <option value="{{ mode }}" {% if config.robust_se_mode==mode %}selected{% endif %}>{{ mode }}</option>
+          {% endfor %}
+        </select>
+        <label><input type="checkbox" name="include_robust_in_stability" {% if config.include_robust_in_stability %}checked{% endif %}> Include robust-valid models in stability</label>
+      </div>
+      <div>
+        <label>Outlier MAD Threshold</label>
+        <input type="number" step="0.1" name="outlier_mad_threshold" value="{{ config.outlier_mad_threshold }}">
+      </div>
+    </div>
+
+    <div class="row3">
+      <div>
+        <label>Max Covariates in Model</label>
+        <input type="number" name="max_covariates_in_model" value="{{ config.max_covariates_in_model }}">
+      </div>
+      <div>
+        <label>Max Interactions in Model</label>
+        <input type="number" name="max_interactions_in_model" value="{{ config.max_interactions_in_model }}">
+      </div>
+      <div>
+        <label>Max Total Models</label>
+        <input type="number" name="max_total_models" value="{{ config.max_total_models }}">
+      </div>
+      <div>
+        <label>Random Seed (heuristic sampling)</label>
+        <input type="number" name="random_seed" value="{{ config.random_seed }}">
+      </div>
+      <div>
+        <label>Min Rows (health check)</label>
+        <input type="number" name="health_min_rows" value="{{ config.health_min_rows }}">
+      </div>
+      <div>
+        <label>Min Rows Per Group</label>
+        <input type="number" name="health_min_rows_per_group" value="{{ config.health_min_rows_per_group }}">
+      </div>
+    </div>
+
+    <div class="row3">
+      <div>
+        <label>VIF Fail / Warn</label>
+        <input type="number" step="0.1" name="vif_fail_threshold" value="{{ config.vif_fail_threshold }}">
+        <input type="number" step="0.1" name="vif_warn_threshold" value="{{ config.vif_warn_threshold }}">
+      </div>
+      <div>
+        <label>BP Alpha / Shapiro Fail / Shapiro Warn</label>
+        <input type="number" step="0.01" name="bp_alpha" value="{{ config.bp_alpha }}">
+        <input type="number" step="0.01" name="shapiro_fail_alpha" value="{{ config.shapiro_fail_alpha }}">
+        <input type="number" step="0.01" name="shapiro_warn_alpha" value="{{ config.shapiro_warn_alpha }}">
+      </div>
+      <div>
+        <label>Cook Threshold Multiplier (default 4/n)</label>
+        <input type="number" step="0.1" name="cook_threshold_multiplier" value="{{ config.cook_threshold_multiplier }}">
+        <label><input type="checkbox" name="cook_fail" {% if config.cook_fail %}checked{% endif %}> Fail model on Cook threshold</label>
+      </div>
+      <div>
+        <label>Engineering Delta</label>
+        <input type="number" step="0.001" name="engineering_delta" value="{{ config.engineering_delta }}">
+      </div>
+      <div>
+        <label>Equivalence Bound</label>
+        <input type="number" step="0.001" name="equivalence_bound" value="{{ config.equivalence_bound }}">
+      </div>
+      <div>
+        <label>Stable Sign / Practical / Non-effect / Redflag Sign</label>
+        <input type="number" step="0.01" name="stable_sign_pct" value="{{ config.stable_sign_pct }}">
+        <input type="number" step="0.01" name="stable_practical_pct" value="{{ config.stable_practical_pct }}">
+        <input type="number" step="0.01" name="non_effect_pct" value="{{ config.non_effect_pct }}">
+        <input type="number" step="0.01" name="sign_flip_redflag_pct" value="{{ config.sign_flip_redflag_pct }}">
+      </div>
+    </div>
+
+    <button type="submit">Create Analysis + Build Outlier List + Build Model Registry</button>
+  </form>
+</div>
+
+<div class="panel">
+  <h2>Current Profile Snapshot</h2>
+  <table>
+    <tr><th>Column</th><th>Type</th><th>Role</th><th>Unique</th><th>Exclude Reason</th></tr>
+    {% for c in columns %}
+      <tr>
+        <td class="mono">{{ c.column_name }}</td>
+        <td>{{ c.inferred_type }}</td>
+        <td>{{ c.model_role }}</td>
+        <td>{{ c.unique_count }}</td>
+        <td>{{ c.exclude_reason }}</td>
+      </tr>
+    {% endfor %}
+  </table>
+  <p class="muted">Excluded high-uniqueness text fields should typically be engineered outside SME (e.g., Power Query).</p>
+</div>
+<script>
+  (function () {
+    function selectedValues(role) {
+      return Array.from(document.querySelectorAll('.var-item[data-role="' + role + '"] input[type="checkbox"]:checked'))
+        .map(function (cb) { return cb.value; });
+    }
+
+    function updateCovariateAvailability() {
+      var reserved = new Set(selectedValues('primary').concat(selectedValues('group')));
+      var covariateItems = document.querySelectorAll('.var-item[data-role="cat_cov"], .var-item[data-role="cont_cov"]');
+      covariateItems.forEach(function (item) {
+        var cb = item.querySelector('input[type="checkbox"]');
+        var shouldLock = reserved.has(cb.value);
+        if (shouldLock && cb.checked) {
+          cb.checked = false;
+        }
+        cb.disabled = shouldLock;
+        item.hidden = shouldLock;
+      });
+    }
+
+    var primaryAndGroup = document.querySelectorAll('.var-item[data-role="primary"] input[type="checkbox"], .var-item[data-role="group"] input[type="checkbox"]');
+    primaryAndGroup.forEach(function (cb) {
+      cb.addEventListener('change', updateCovariateAvailability);
+    });
+    updateCovariateAvailability();
+  })();
+</script>
+{% endblock %}

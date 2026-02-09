@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+{% set current_tab = 'run' %}
+{% include "_analysis_tabs.html" %}
+<div class="panel">
+  <h2>Run Candidate Models (Analysis {{ analysis.id }})</h2>
+  <p>Registry count: <strong>{{ registry_count }}</strong></p>
+  <p class="muted">Each model is fitted, diagnostics checked, and recorded as valid / invalid / valid-with-robust-SE.</p>
+  <form method="post">
+    <button type="submit">Run Model Universe</button>
+  </form>
+</div>
+{% endblock %}

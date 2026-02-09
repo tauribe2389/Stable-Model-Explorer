@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+{% set current_tab = 'report' %}
+{% include "_analysis_tabs.html" %}
+<div class="panel">
+  <h2>8) Report Export (Analysis {{ analysis.id }})</h2>
+  <form method="post">
+    <button type="submit">Generate HTML + PDF Snapshot</button>
+  </form>
+  <p class="muted">Exports include config JSON, outlier policy, registry outcomes, diagnostics, and stability thresholds for auditability.</p>
+</div>
+
+<div class="panel">
+  <h3>Snapshots</h3>
+  <table>
+    <tr><th>Created</th><th>HTML</th><th>PDF</th><th>Meta</th></tr>
+    {% for s in snapshots %}
+      <tr>
+        <td>{{ s.created_at }}</td>
+        <td><a href="{{ url_for('sme.download_file', path=s.html_path) }}">{{ s.html_path }}</a></td>
+        <td><a href="{{ url_for('sme.download_file', path=s.pdf_path) }}">{{ s.pdf_path }}</a></td>
+        <td class="mono">{{ s.meta_json }}</td>
+      </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}

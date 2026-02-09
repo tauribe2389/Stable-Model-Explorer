@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="panel">
+  <div class="dataset-card-top">
+    <div>
+      <h2>{{ dataset.name }}</h2>
+      <p class="muted">
+        Rows: {{ dataset.row_count }} | Columns: {{ dataset.col_count }} |
+        Uploaded: {{ dataset.uploaded_at_friendly }} |
+        Modified: {{ dataset.updated_at_friendly }}
+      </p>
+    </div>
+    <a class="primary-btn" href="{{ url_for('sme.analysis_new', dataset_id=dataset.id) }}">Start Analysis Wizard</a>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Profiling Rules</h2>
+  <p class="muted">These rules control how columns are automatically classified before model generation.</p>
+  <form method="post" action="{{ url_for('sme.reprofile', dataset_id=dataset.id) }}">
+    <details class="advanced-panel">
+      <summary>Advanced Profiling Settings</summary>
+      <div class="row3">
+        <div>
+          <label>Max Categorical Cardinality</label>
+          <input type="number" name="categorical_max_cardinality" value="{{ dataset.profile_rules.categorical_max_cardinality }}">
+          <div class="hint">Columns at or below this unique-value count are classified as categorical.</div>
+        </div>
+        <div>
+          <label>Datetime-as-Categorical Max Cardinality</label>
+          <input type="number" name="datetime_categorical_max_cardinality" value="{{ dataset.profile_rules.datetime_categorical_max_cardinality }}">
+          <div class="hint">Datetime fields with low distinct count are treated as categorical groups instead of continuous time.</div>
+        </div>
+        <div>
+          <label>Text Uniqueness Exclude Threshold</label>
+          <input type="number" name="text_unique_ratio_exclude" value="{{ dataset.profile_rules.text_unique_ratio_exclude }}" step="0.01">
+          <div class="hint">If text is mostly unique above this ratio, it is classified as excluded (likely IDs/free text).</div>
+        </div>
+      </div>
+    </details>
+    <p class="muted">Reminder: high-uniqueness text columns are excluded; use Power Query for engineered transformations.</p>
+    <button type="submit">Apply Profiling Rules</button>
+  </form>
+</div>
+
+<div class="panel">
+  <h2>Profiling Summary</h2>
+  <table class="profile-summary-table">
+    <tr>
+      <th>Categorical</th>
+      <th>Continuous</th>
+      <th>Excluded</th>
+      <th>Columns With Missing Data</th>
+    </tr>
+    <tr>
+      <td>{{ profile_summary.categorical_count }}</td>
+      <td>{{ profile_summary.continuous_count }}</td>
+      <td>{{ profile_summary.excluded_count }}</td>
+      <td>{{ profile_summary.missing_columns_count }}</td>
+    </tr>
+  </table>
+</div>
+
+<div class="panel">
+  <h2>Variable Classification</h2>
+  <form method="post" action="{{ url_for('sme.update_dataset_roles', dataset_id=dataset.id) }}">
+    <div class="table-wrap">
+      <table class="variable-table">
+        <tr>
+          <th>Column</th>
+          <th>Detected Type</th>
+          <th class="model-role-col">Model Role (editable)</th>
+          <th>Unique</th>
+          <th>Missing</th>
+          <th class="ratio-head" title="Share of non-null values that can be parsed as numeric.">Numeric Ratio</th>
+          <th class="ratio-head" title="Share of non-null values that can be parsed as datetime.">Datetime Ratio</th>
+          <th>Exclude Reason</th>
+        </tr>
+        {% for c in columns %}
+          <tr class="role-{{ c.model_role }}">
+            <td class="mono">{{ c.column_name }}</td>
+            <td>{{ c.inferred_type }}</td>
+            <td class="model-role-cell">
+              <select class="role-select" name="role_{{ c.id }}">
+                {% for role in c.allowed_roles %}
+                  <option value="{{ role }}" {% if c.model_role == role %}selected{% endif %}>{{ role }}</option>
+                {% endfor %}
+              </select>
+            </td>
+            <td>
+              <a href="{{ url_for('sme.dataset_column_preview', dataset_id=dataset.id, column_name=c.column_name) }}">
+                {{ c.unique_count }}
+              </a>
+            </td>
+            <td>{{ c.missing_count }}</td>
+            <td class="ratio-cell">{{ "%.2f"|format(c.numeric_ratio) }}</td>
+            <td class="ratio-cell">{{ "%.2f"|format(c.datetime_ratio) }}</td>
+            <td>{{ c.exclude_reason }}</td>
+          </tr>
+        {% endfor %}
+      </table>
+    </div>
+    <p class="muted">Tip: click the unique-count value to preview distinct values and sample rows for that column.</p>
+    <button type="submit">Save Role Overrides</button>
+  </form>
+</div>
+{% endblock %}

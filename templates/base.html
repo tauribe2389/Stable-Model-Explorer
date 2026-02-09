@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Stable Model Explorer</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <h1><a href="{{ url_for('sme.home') }}" style="color:#f8fafc;text-decoration:none;">Stable Model Explorer</a></h1>
+    <div class="sub">Local-first ANOVA/ANCOVA workflow for engineering test programs</div>
+  </header>
+  <div class="wrap">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="flash {{ category }}" data-flash data-duration="4200">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+    {% block content %}{% endblock %}
+  </div>
+  <script>
+    (function () {
+      var flashes = document.querySelectorAll("[data-flash]");
+      flashes.forEach(function (el) {
+        var duration = parseInt(el.getAttribute("data-duration") || "4200", 10);
+        window.setTimeout(function () {
+          el.classList.add("hide");
+          window.setTimeout(function () {
+            if (el && el.parentNode) {
+              el.parentNode.removeChild(el);
+            }
+          }, 420);
+        }, duration);
+      });
+    })();
+  </script>
+</body>
+</html>
