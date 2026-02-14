@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="panel">
+  <h2>1) Upload Dataset</h2>
+  <form method="post" action="{{ url_for('sme.upload') }}" enctype="multipart/form-data">
+    <div class="row">
+      <div>
+        <label>Dataset Name</label>
+        <input type="text" name="dataset_name" placeholder="e.g. Adhesive DOE Run 17">
+      </div>
+      <div>
+        <label>CSV File</label>
+        <input type="file" name="dataset_csv" accept=".csv">
+      </div>
+    </div>
+    <div style="margin-top:10px;">
+      <button type="submit">Ingest Dataset</button>
+    </div>
+
+    <details class="advanced-panel">
+      <summary>Advanced Data Classification Settings</summary>
+      <div class="row3">
+        <div>
+          <label>Max Categorical Cardinality</label>
+          <input type="number" name="categorical_max_cardinality" value="20">
+          <div class="hint">If a column has unique values at or below this count, SME classifies it as categorical.</div>
+        </div>
+        <div>
+          <label>Datetime-as-Categorical Max Cardinality</label>
+          <input type="number" name="datetime_categorical_max_cardinality" value="31">
+          <div class="hint">Controls when parsed datetime fields are treated as categories (for example, day/batch buckets) instead of continuous time.</div>
+        </div>
+        <div>
+          <label>Text Unique Ratio Exclude Threshold</label>
+          <input type="number" name="text_unique_ratio_exclude" value="0.9" step="0.01">
+          <div class="hint">If a text column is mostly unique above this ratio, SME marks it as ID/free-text and excludes it from modeling.</div>
+        </div>
+      </div>
+      <p class="muted">Tip: use Power Query to pre-clean IDs and free text before modeling.</p>
+    </details>
+  </form>
+</div>
+
+<div class="panel">
+  <h2>Datasets</h2>
+  <table>
+    <tr>
+      <th class="primary-id">Name</th><th>Rows</th><th>Cols</th><th>Uploaded</th><th>Modified</th><th>Actions</th>
+    </tr>
+    {% for d in datasets %}
+      <tr>
+        <td class="primary-id">{{ d.name }}</td>
+        <td>{{ d.row_count }}</td>
+        <td>{{ d.col_count }}</td>
+        <td title="{{ d.uploaded_at }}">{{ d.uploaded_at_friendly }}</td>
+        <td title="{{ d.updated_at }}">{{ d.updated_at_friendly }}</td>
+        <td>
+          <div class="action-group">
+            <a class="link-btn" href="{{ url_for('sme.dataset_detail', dataset_id=d.id) }}">Data Profile</a>
+            <a class="link-btn" href="{{ url_for('sme.analysis_new', dataset_id=d.id) }}">New Analysis</a>
+            <form class="action-inline-form" method="post" action="{{ url_for('sme.delete_dataset', dataset_id=d.id) }}" onsubmit="return confirm('Delete dataset &quot;{{ d.name }}&quot; and all related analyses/artifacts?');">
+              <button type="submit" class="link-btn link-btn-danger">Delete</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+    {% endfor %}
+  </table>
+</div>
+
+<div class="panel">
+  <h2>Analyses</h2>
+  <table>
+    <tr>
+      <th class="primary-id">Name</th><th>Dataset</th><th>Status</th><th>Created</th><th>Modified</th><th>Actions</th>
+    </tr>
+    {% for a in analyses %}
+      <tr>
+        <td class="primary-id">{{ a.name }}</td>
+        <td>{{ a.dataset_name }}</td>
+        <td>{{ a.status }}</td>
+        <td title="{{ a.created_at }}">{{ a.created_at_friendly }}</td>
+        <td title="{{ a.updated_at }}">{{ a.updated_at_friendly }}</td>
+        <td>
+          <div class="action-group">
+            <a class="link-btn" href="{{ url_for('sme.analysis_overview', analysis_id=a.id) }}">Overview</a>
+            <form class="action-inline-form" method="post" action="{{ url_for('sme.delete_analysis', analysis_id=a.id) }}" onsubmit="return confirm('Delete analysis &quot;{{ a.name }}&quot;?');">
+              <button type="submit" class="link-btn link-btn-danger">Delete</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+    {% endfor %}
+  </table>
+</div>
+
+<div class="panel">
+  <h2>Saved Presets</h2>
+  <table>
+    <tr><th>Name</th><th>Updated</th></tr>
+    {% for p in presets %}
+      <tr><td>{{ p.name }}</td><td>{{ p.updated_at }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}

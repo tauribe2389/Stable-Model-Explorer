@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+instance/sme.db
+uploads/*
+artifacts/plots/*
+artifacts/reports/*
+!uploads/.gitkeep
+!artifacts/plots/.gitkeep
+!artifacts/reports/.gitkeep

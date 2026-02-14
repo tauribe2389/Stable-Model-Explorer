@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+{% set current_tab = 'outliers' %}
+{% include "_analysis_tabs.html" %}
+<div class="panel">
+  <h2>4) Outlier Review (Analysis {{ analysis.id }})</h2>
+</div>
+
+<div class="panel">
+  <form method="post">
+    <p class="muted">Outliers flagged by robust z-score using MAD within selected groups. No per-model silent removals occur.</p>
+    <table>
+      <tr>
+        <th>row_index</th><th>group</th><th>variable</th><th>robust_z</th><th>reason</th><th>decision</th>
+      </tr>
+      {% for o in outliers %}
+        <tr>
+          <td class="mono">{{ o.row_index }}</td>
+          <td class="mono">{{ o.group_key }}</td>
+          <td>{{ o.variable }}</td>
+          <td>{{ "%.3f"|format(o.robust_z) }}</td>
+          <td>{{ o.reason }}</td>
+          <td>
+            <select name="decision_{{ o.row_index }}">
+              <option value="keep" {% if o.decision=='keep' %}selected{% endif %}>keep</option>
+              <option value="remove" {% if o.decision=='remove' %}selected{% endif %}>remove</option>
+            </select>
+          </td>
+        </tr>
+      {% endfor %}
+    </table>
+    {% if not outliers %}
+      <p>No outliers detected for the configured grouping and threshold.</p>
+    {% endif %}
+    <button type="submit" name="action" value="save">Save Decisions</button>
+    <button type="submit" name="action" value="run">Save + Continue to Model Run</button>
+  </form>
+</div>
+{% endblock %}

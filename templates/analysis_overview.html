@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block content %}
+{% set current_tab = 'overview' %}
+{% include "_analysis_tabs.html" %}
+<div class="panel">
+  <h2>Analysis Overview</h2>
+  <p class="muted">Name: {{ analysis.name }} | Dataset: {{ dataset.name }} | Status: {{ analysis.status }}</p>
+</div>
+
+<div class="panel">
+  <h3>Configuration Summary</h3>
+  <div class="config-grid">
+    <div class="config-card">
+      <div class="muted">Response</div>
+      <div class="mono">{{ config_summary.response or '(not selected)' }}</div>
+    </div>
+    <div class="config-card">
+      <div class="muted">Primary Factors</div>
+      <div>{{ config_summary.primary_factors|join(', ') if config_summary.primary_factors else '(none)' }}</div>
+    </div>
+    <div class="config-card">
+      <div class="muted">Grouping Variables</div>
+      <div>{{ config_summary.group_variables|join(', ') if config_summary.group_variables else '(none)' }}</div>
+    </div>
+    <div class="config-card">
+      <div class="muted">Categorical Covariates</div>
+      <div>{{ config_summary.categorical_covariates|join(', ') if config_summary.categorical_covariates else '(none)' }}</div>
+    </div>
+    <div class="config-card">
+      <div class="muted">Continuous Covariates</div>
+      <div>{{ config_summary.continuous_covariates|join(', ') if config_summary.continuous_covariates else '(none)' }}</div>
+    </div>
+    <div class="config-card">
+      <div class="muted">Forced Terms</div>
+      <div>{{ config_summary.forced_terms|join(', ') if config_summary.forced_terms else '(none)' }}</div>
+    </div>
+    <div class="config-card">
+      <div class="muted">Interactions</div>
+      <div>{{ config_summary.interaction_candidates|join(', ') if config_summary.interaction_candidates else '(none)' }}</div>
+    </div>
+    <div class="config-card">
+      <div class="muted">Model Caps</div>
+      <div class="mono">
+        cov={{ config_summary.model_caps.max_covariates_in_model }},
+        int={{ config_summary.model_caps.max_interactions_in_model }},
+        total={{ config_summary.model_caps.max_total_models }},
+        seed={{ config_summary.model_caps.random_seed }}
+      </div>
+    </div>
+    <div class="config-card">
+      <div class="muted">Robust SE Mode</div>
+      <div class="mono">{{ config_summary.robust_se_mode }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h3>Health Check Flags</h3>
+  <div class="card-grid">
+    <div class="card"><div class="muted">Rows Evaluated</div><div>{{ health_summary.rows }}</div></div>
+    <div class="card"><div class="muted">Passed Checks</div><div>{{ health_summary.passed }}</div></div>
+    <div class="card"><div class="muted">Failed Checks</div><div>{{ health_summary.failed }}</div></div>
+    <div class="card"><div class="muted">Overall</div><div>{{ 'PASS' if health_summary.all_passed else 'ATTENTION' }}</div></div>
+  </div>
+  <div class="health-flag-list">
+    {% for h in health_flags %}
+      <div class="health-flag {% if h.passed %}ok{% else %}fail{% endif %}">
+        <strong>{% if h.passed %}[OK]{% else %}[FLAG]{% endif %} {{ h.label }}</strong>
+        <div class="muted">{{ h.detail }}</div>
+      </div>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}

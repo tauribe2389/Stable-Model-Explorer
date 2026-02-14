@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block content %}
+{% set current_tab = 'stability' %}
+{% include "_analysis_tabs.html" %}
+<div class="panel">
+  <h2>7) Stability Dashboard (Analysis {{ analysis.id }})</h2>
+  <form method="post">
+    <label><input type="checkbox" name="include_robust" {% if config.include_robust_in_stability %}checked{% endif %}> Include valid-with-robust-SE models</label>
+    <button type="submit">Run Stability Analysis</button>
+  </form>
+  <p class="muted">Buckets: Stable / Conditional / Non-effect / Red-flag.</p>
+  <p><a href="{{ url_for('sme.model_runs_summary', analysis_id=analysis.id) }}">Back to model runs</a></p>
+</div>
+
+{% if stability %}
+  <div class="panel">
+    <h3>Separation of Effects Summary</h3>
+    <div class="card-grid">
+      <div class="card"><div class="muted">Models Used</div><div>{{ stability.summary.n_models_used }}</div></div>
+      <div class="card"><div class="muted">Stable</div><div>{{ stability.summary.bucket_counts.STABLE }}</div></div>
+      <div class="card"><div class="muted">Conditional</div><div>{{ stability.summary.bucket_counts.CONDITIONAL }}</div></div>
+      <div class="card"><div class="muted">Non-effect</div><div>{{ stability.summary.bucket_counts.NON_EFFECT }}</div></div>
+      <div class="card"><div class="muted">Red-flag</div><div>{{ stability.summary.bucket_counts.REDFLAG }}</div></div>
+      <div class="card"><div class="muted">ANOVA Models</div><div>{{ stability.stratified.ANOVA.n_models }}</div></div>
+      <div class="card"><div class="muted">ANCOVA Models</div><div>{{ stability.stratified.ANCOVA.n_models }}</div></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Term-Level Stability Table</h3>
+    <p class="muted">Click the chart icon to view the effect distribution or rank stability plot for that row.</p>
+    <table>
+      <tr>
+        <th>Plot</th><th>Effect ID</th><th>Type</th><th>Factor</th><th>Levels</th><th>Median</th><th>IQR</th><th>Sign Consistency</th><th>Practical Rate</th><th>Equivalence Rate</th><th>Bucket</th><th>Narrative</th>
+      </tr>
+      {% for e in stability.effects %}
+        <tr>
+          <td>
+            {% if e.plot_path %}
+              <a class="plot-icon-btn" href="{{ url_for('sme.view_artifact', path=e.plot_path) }}" target="_blank" title="View effect plot">&#128202;</a>
+            {% else %}
+              <span class="muted">-</span>
+            {% endif %}
+          </td>
+          <td class="mono">{{ e.effect_id }}</td>
+          <td>{{ e.effect_type }}</td>
+          <td>{{ e.factor_name }}</td>
+          <td>{{ e.level_a }} {% if e.level_b %}vs {{ e.level_b }}{% endif %}</td>
+          <td>{{ "%.4f"|format(e.estimate_distribution.median) if e.estimate_distribution else '' }}</td>
+          <td>{{ "%.4f"|format(e.estimate_distribution.iqr) if e.estimate_distribution else '' }}</td>
+          <td>{{ e.sign_consistency }}</td>
+          <td>{{ e.practical_rate }}</td>
+          <td>{{ e.equivalence_rate }}</td>
+          <td>{{ e.bucket }}</td>
+          <td>{{ e.narrative }}</td>
+        </tr>
+      {% endfor %}
+    </table>
+  </div>
+{% else %}
+  <div class="panel"><p>No stability result yet.</p></div>
+{% endif %}
+{% endblock %}
