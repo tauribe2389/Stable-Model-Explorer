@@ -2,15 +2,15 @@
 {% block content %}
 <div class="panel">
   <h2>1) Upload Dataset</h2>
-  <form method="post" action="{{ url_for('sme.upload') }}" enctype="multipart/form-data">
+  <form id="dataset-upload-form" method="post" action="{{ url_for('sme.upload') }}" enctype="multipart/form-data">
     <div class="row">
       <div>
         <label>Dataset Name</label>
-        <input type="text" name="dataset_name" placeholder="e.g. Adhesive DOE Run 17">
+        <input id="dataset-name-input" type="text" name="dataset_name" placeholder="e.g. Adhesive DOE Run 17">
       </div>
       <div>
         <label>CSV File</label>
-        <input type="file" name="dataset_csv" accept=".csv">
+        <input id="dataset-file-input" type="file" name="dataset_csv" accept=".csv">
       </div>
     </div>
     <div style="margin-top:10px;">
@@ -43,17 +43,22 @@
 
 <div class="panel">
   <h2>Datasets</h2>
-  <table>
+  <table data-sortable="true">
     <tr>
-      <th class="primary-id">Name</th><th>Rows</th><th>Cols</th><th>Uploaded</th><th>Modified</th><th>Actions</th>
+      <th class="primary-id" data-sort-type="text">Name</th>
+      <th data-sort-type="numeric">Rows</th>
+      <th data-sort-type="numeric">Cols</th>
+      <th data-sort-type="text">Uploaded</th>
+      <th data-sort-type="text">Modified</th>
+      <th data-sortable="false">Actions</th>
     </tr>
     {% for d in datasets %}
       <tr>
         <td class="primary-id">{{ d.name }}</td>
         <td>{{ d.row_count }}</td>
         <td>{{ d.col_count }}</td>
-        <td title="{{ d.uploaded_at }}">{{ d.uploaded_at_friendly }}</td>
-        <td title="{{ d.updated_at }}">{{ d.updated_at_friendly }}</td>
+        <td title="{{ d.uploaded_at }}" data-sort-value="{{ d.uploaded_at }}">{{ d.uploaded_at_friendly }}</td>
+        <td title="{{ d.updated_at }}" data-sort-value="{{ d.updated_at }}">{{ d.updated_at_friendly }}</td>
         <td>
           <div class="action-group">
             <a class="link-btn" href="{{ url_for('sme.dataset_detail', dataset_id=d.id) }}">Data Profile</a>
@@ -70,17 +75,22 @@
 
 <div class="panel">
   <h2>Analyses</h2>
-  <table>
+  <table data-sortable="true">
     <tr>
-      <th class="primary-id">Name</th><th>Dataset</th><th>Status</th><th>Created</th><th>Modified</th><th>Actions</th>
+      <th class="primary-id" data-sort-type="text">Name</th>
+      <th data-sort-type="text">Dataset</th>
+      <th data-sort-type="text">Status</th>
+      <th data-sort-type="text">Created</th>
+      <th data-sort-type="text">Modified</th>
+      <th data-sortable="false">Actions</th>
     </tr>
     {% for a in analyses %}
       <tr>
         <td class="primary-id">{{ a.name }}</td>
         <td>{{ a.dataset_name }}</td>
         <td>{{ a.status }}</td>
-        <td title="{{ a.created_at }}">{{ a.created_at_friendly }}</td>
-        <td title="{{ a.updated_at }}">{{ a.updated_at_friendly }}</td>
+        <td title="{{ a.created_at }}" data-sort-value="{{ a.created_at }}">{{ a.created_at_friendly }}</td>
+        <td title="{{ a.updated_at }}" data-sort-value="{{ a.updated_at }}">{{ a.updated_at_friendly }}</td>
         <td>
           <div class="action-group">
             <a class="link-btn" href="{{ url_for('sme.analysis_overview', analysis_id=a.id) }}">Overview</a>
@@ -96,11 +106,57 @@
 
 <div class="panel">
   <h2>Saved Presets</h2>
-  <table>
-    <tr><th>Name</th><th>Updated</th></tr>
+  <table data-sortable="true">
+    <tr>
+      <th data-sort-type="text">Name</th>
+      <th data-sort-type="text">Updated</th>
+    </tr>
     {% for p in presets %}
-      <tr><td>{{ p.name }}</td><td>{{ p.updated_at }}</td></tr>
+      <tr><td>{{ p.name }}</td><td data-sort-value="{{ p.updated_at }}">{{ p.updated_at }}</td></tr>
     {% endfor %}
   </table>
 </div>
+<script>
+  (function () {
+    var form = document.getElementById("dataset-upload-form");
+    var nameInput = document.getElementById("dataset-name-input");
+    var fileInput = document.getElementById("dataset-file-input");
+    if (!form || !nameInput || !fileInput) {
+      return;
+    }
+
+    var storageKey = "sme_dataset_name_draft";
+    try {
+      var draft = window.sessionStorage.getItem(storageKey);
+      if (!nameInput.value && draft) {
+        nameInput.value = draft;
+      }
+    } catch (e) {}
+
+    function persistDraft() {
+      try {
+        window.sessionStorage.setItem(storageKey, nameInput.value || "");
+      } catch (e) {}
+    }
+
+    nameInput.addEventListener("input", persistDraft);
+    nameInput.addEventListener("change", persistDraft);
+
+    fileInput.addEventListener("change", function () {
+      var typed = nameInput.value || "";
+      window.setTimeout(function () {
+        if (!nameInput.value && typed) {
+          nameInput.value = typed;
+        }
+        persistDraft();
+      }, 0);
+    });
+
+    form.addEventListener("submit", function () {
+      try {
+        window.sessionStorage.removeItem(storageKey);
+      } catch (e) {}
+    });
+  })();
+</script>
 {% endblock %}

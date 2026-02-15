@@ -3,11 +3,22 @@
 {% set current_tab = 'run' %}
 {% include "_analysis_tabs.html" %}
 <div class="panel">
-  <h2>Run Candidate Models (Analysis {{ analysis.id }})</h2>
+  <h2>Run Candidate Models</h2>
   <p>Registry count: <strong>{{ registry_count }}</strong></p>
   <p class="muted">Each model is fitted, diagnostics checked, and recorded as valid / invalid / valid-with-robust-SE.</p>
-  <form method="post">
-    <button type="submit">Run Model Universe</button>
+  <form method="post" id="run-models-form">
+    <button type="submit" id="run-models-btn">Run Model Universe</button>
   </form>
 </div>
+<script>
+  (function () {
+    var form = document.getElementById("run-models-form");
+    var btn = document.getElementById("run-models-btn");
+    if (!form || !btn) return;
+    form.addEventListener("submit", function () {
+      btn.disabled = true;
+      btn.textContent = "Running...";
+    });
+  })();
+</script>
 {% endblock %}

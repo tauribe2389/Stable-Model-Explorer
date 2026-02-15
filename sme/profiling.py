@@ -1,9 +1,7 @@
 from __future__ import annotations
 
+import itertools
 import json
-import math
-import random
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -338,10 +336,394 @@ def _series_numeric(df: pd.DataFrame, col: str) -> pd.Series:
     return pd.to_numeric(df[col], errors="coerce")
 
 
+def _stringify_group_value(value: Any) -> str:
+    if pd.isna(value):
+        return "__NA__"
+    text = str(value)
+    return text if text != "" else "__NA__"
+
+
 def _group_label(row: pd.Series, group_vars: list[str]) -> str:
     if not group_vars:
         return "__ALL__"
-    return "|".join(f"{g}={row[g]}" for g in group_vars)
+    return "|".join(f"{g}={_stringify_group_value(row[g])}" for g in group_vars)
+
+
+def _group_values_from_parts(group_vars: list[str], key_parts: tuple[Any, ...] | Any) -> dict[str, str]:
+    if not group_vars:
+        return {}
+    if len(group_vars) == 1:
+        key_tuple = (key_parts,)
+    else:
+        key_tuple = tuple(key_parts)
+    return {
+        group_vars[idx]: _stringify_group_value(key_tuple[idx]) for idx in range(len(group_vars))
+    }
+
+
+def _group_key_from_values(group_vars: list[str], values: dict[str, Any]) -> str:
+    if not group_vars:
+        return "__ALL__"
+    return "|".join(f"{g}={_stringify_group_value(values.get(g))}" for g in group_vars)
+
+
+def build_group_manifest(
+    df: pd.DataFrame,
+    response: str,
+    primary_factors: list[str],
+    group_variables: list[str],
+    min_rows_per_group: int,
+    min_primary_level_n: int,
+    max_groups_analyzed: int,
+    include_unobserved: bool = False,
+    missing_policy: str = "AS_LEVEL",
+) -> dict[str, Any]:
+    missing_policy = str(missing_policy or "AS_LEVEL").strip().upper()
+    max_groups = max(1, int(max_groups_analyzed))
+    min_rows_per_group = max(1, int(min_rows_per_group))
+    min_primary_level_n = max(1, int(min_primary_level_n))
+
+    source = df.copy()
+    total_rows = int(len(source))
+    if "row_index" not in source.columns:
+        source = source.reset_index(drop=False).rename(columns={"index": "row_index"})
+
+    rows_dropped_missing_group = 0
+    if group_variables:
+        if missing_policy == "DROP_ROWS":
+            missing_mask = source[group_variables].isna().any(axis=1)
+            rows_dropped_missing_group = int(missing_mask.sum())
+            source = source.loc[~missing_mask].copy()
+        for col in group_variables:
+            source[col] = source[col].map(_stringify_group_value)
+
+    rows_considered = int(len(source))
+    groups: list[dict[str, Any]] = []
+    row_group_map: list[dict[str, Any]] = []
+
+    if not group_variables:
+        group_key = "__ALL__"
+        rows_raw = rows_considered
+        response_numeric_rows = int(pd.to_numeric(source.get(response, pd.Series(dtype=float)), errors="coerce").notna().sum())
+        primary_stats: dict[str, dict[str, Any]] = {}
+        for factor in primary_factors:
+            if factor not in source.columns:
+                primary_stats[factor] = {"missing_column": True, "n_levels": 0, "min_level_n": 0}
+                continue
+            vals = source[factor].dropna().astype(str)
+            counts = vals.value_counts()
+            primary_stats[factor] = {
+                "missing_column": False,
+                "n_levels": int(len(counts)),
+                "min_level_n": int(counts.min()) if len(counts) else 0,
+            }
+
+        reasons: list[str] = []
+        if rows_raw < min_rows_per_group:
+            reasons.append(f"Rows {rows_raw} below minimum per group {min_rows_per_group}.")
+        if response not in source.columns:
+            reasons.append(f"Response column missing: {response}.")
+        elif response_numeric_rows < min_rows_per_group:
+            reasons.append(f"Numeric response rows {response_numeric_rows} below minimum per group {min_rows_per_group}.")
+        for factor in primary_factors:
+            stat = primary_stats.get(factor, {})
+            if stat.get("missing_column"):
+                reasons.append(f"Primary factor missing: {factor}.")
+                continue
+            if int(stat.get("n_levels", 0)) < 2:
+                reasons.append(f"Primary factor {factor} has fewer than 2 levels within group.")
+                continue
+            if int(stat.get("min_level_n", 0)) < min_primary_level_n:
+                reasons.append(
+                    f"Primary factor {factor} has level count below {min_primary_level_n} within group."
+                )
+
+        is_viable = len(reasons) == 0
+        groups.append(
+            {
+                "group_key": group_key,
+                "group_values": {},
+                "is_observed": True,
+                "n_rows_raw": rows_raw,
+                "response_numeric_rows": response_numeric_rows,
+                "primary_stats": primary_stats,
+                "is_viable": is_viable,
+                "viability_reasons": reasons,
+                "is_selected": bool(is_viable),
+                "skip_reason": "" if is_viable else (reasons[0] if reasons else "Group is not viable."),
+            }
+        )
+        row_group_map = [{"row_index": int(x), "group_key": group_key} for x in source["row_index"].tolist()]
+    else:
+        observed_map: dict[str, dict[str, Any]] = {}
+        grouped = source.groupby(group_variables, sort=False)
+        for raw_key, grp in grouped:
+            group_values = _group_values_from_parts(group_variables, raw_key)
+            group_key = _group_key_from_values(group_variables, group_values)
+            response_numeric_rows = int(pd.to_numeric(grp[response], errors="coerce").notna().sum()) if response in grp.columns else 0
+            primary_stats: dict[str, dict[str, Any]] = {}
+            for factor in primary_factors:
+                if factor not in grp.columns:
+                    primary_stats[factor] = {"missing_column": True, "n_levels": 0, "min_level_n": 0}
+                    continue
+                vals = grp[factor].dropna().astype(str)
+                counts = vals.value_counts()
+                primary_stats[factor] = {
+                    "missing_column": False,
+                    "n_levels": int(len(counts)),
+                    "min_level_n": int(counts.min()) if len(counts) else 0,
+                }
+            observed_map[group_key] = {
+                "group_values": group_values,
+                "is_observed": True,
+                "n_rows_raw": int(len(grp)),
+                "response_numeric_rows": response_numeric_rows,
+                "primary_stats": primary_stats,
+                "row_indices": [int(x) for x in grp["row_index"].tolist()],
+            }
+
+        if include_unobserved:
+            level_sets = []
+            for col in group_variables:
+                vals = sorted({_stringify_group_value(v) for v in source[col].tolist()})
+                level_sets.append(vals if vals else ["__NA__"])
+            for combo in itertools.product(*level_sets):
+                group_values = {group_variables[i]: combo[i] for i in range(len(group_variables))}
+                group_key = _group_key_from_values(group_variables, group_values)
+                if group_key in observed_map:
+                    continue
+                observed_map[group_key] = {
+                    "group_values": group_values,
+                    "is_observed": False,
+                    "n_rows_raw": 0,
+                    "response_numeric_rows": 0,
+                    "primary_stats": {},
+                    "row_indices": [],
+                }
+
+        for group_key in sorted(observed_map.keys()):
+            rec = observed_map[group_key]
+            reasons: list[str] = []
+            if not rec["is_observed"]:
+                reasons.append("Unobserved combination (auto-skipped).")
+            if int(rec["n_rows_raw"]) < min_rows_per_group:
+                reasons.append(f"Rows {rec['n_rows_raw']} below minimum per group {min_rows_per_group}.")
+            if response not in source.columns:
+                reasons.append(f"Response column missing: {response}.")
+            elif int(rec["response_numeric_rows"]) < min_rows_per_group:
+                reasons.append(
+                    f"Numeric response rows {rec['response_numeric_rows']} below minimum per group {min_rows_per_group}."
+                )
+
+            for factor in primary_factors:
+                stat = rec["primary_stats"].get(factor)
+                if stat is None or stat.get("missing_column"):
+                    reasons.append(f"Primary factor missing: {factor}.")
+                    continue
+                if int(stat.get("n_levels", 0)) < 2:
+                    reasons.append(f"Primary factor {factor} has fewer than 2 levels within group.")
+                    continue
+                if int(stat.get("min_level_n", 0)) < min_primary_level_n:
+                    reasons.append(
+                        f"Primary factor {factor} has level count below {min_primary_level_n} within group."
+                    )
+
+            is_viable = len(reasons) == 0
+            groups.append(
+                {
+                    "group_key": group_key,
+                    "group_values": rec["group_values"],
+                    "is_observed": bool(rec["is_observed"]),
+                    "n_rows_raw": int(rec["n_rows_raw"]),
+                    "response_numeric_rows": int(rec["response_numeric_rows"]),
+                    "primary_stats": rec["primary_stats"],
+                    "is_viable": is_viable,
+                    "viability_reasons": reasons,
+                    "is_selected": False,
+                    "skip_reason": reasons[0] if reasons else "",
+                }
+            )
+            for row_index in rec["row_indices"]:
+                row_group_map.append({"row_index": int(row_index), "group_key": group_key})
+
+        viable_observed = [g for g in groups if g["is_observed"] and g["is_viable"]]
+        viable_observed.sort(key=lambda x: (-int(x["n_rows_raw"]), str(x["group_key"])))
+        selected_keys = {g["group_key"] for g in viable_observed[:max_groups]}
+        for g in groups:
+            if not g["is_viable"]:
+                g["is_selected"] = False
+                if not g["skip_reason"]:
+                    g["skip_reason"] = "Group is not viable."
+                continue
+            if g["group_key"] in selected_keys:
+                g["is_selected"] = True
+                g["skip_reason"] = ""
+            else:
+                g["is_selected"] = False
+                g["skip_reason"] = f"Excluded by group_max_groups_analyzed={max_groups}."
+
+    selected_group_keys = [g["group_key"] for g in groups if g["is_selected"]]
+    selected_rows = int(sum(int(g["n_rows_raw"]) for g in groups if g["is_selected"] and g["is_observed"]))
+    observed_groups = [g for g in groups if g["is_observed"]]
+    min_group_size_raw = min((int(g["n_rows_raw"]) for g in observed_groups), default=0)
+    coverage_rows = float(selected_rows / rows_considered) if rows_considered > 0 else 0.0
+    summary = {
+        "group_variables": list(group_variables),
+        "missing_policy": missing_policy,
+        "include_unobserved_combinations": bool(include_unobserved),
+        "max_groups_analyzed": max_groups,
+        "min_primary_level_n": min_primary_level_n,
+        "rows_total": total_rows,
+        "rows_considered": rows_considered,
+        "rows_dropped_missing_group": rows_dropped_missing_group,
+        "group_count_total": len(groups),
+        "group_count_observed": len(observed_groups),
+        "group_count_viable": sum(1 for g in groups if g["is_viable"]),
+        "selected_group_count": len(selected_group_keys),
+        "selected_group_keys": selected_group_keys,
+        "coverage_rows": coverage_rows,
+        "selected_rows": selected_rows,
+        "min_group_size_raw": min_group_size_raw,
+        "skipped_non_viable_count": sum(1 for g in groups if not g["is_viable"]),
+        "skipped_limit_count": sum(1 for g in groups if g["is_viable"] and not g["is_selected"]),
+    }
+    return {
+        "summary": summary,
+        "groups": groups,
+        "row_group_map": row_group_map,
+    }
+
+
+def persist_analysis_groups(db_path: str, analysis_id: int, manifest: dict[str, Any]) -> None:
+    groups = manifest.get("groups", [])
+    row_group_map = manifest.get("row_group_map", [])
+    now = utcnow_iso()
+    with get_conn(db_path) as conn:
+        conn.execute("DELETE FROM analysis_group_rows WHERE analysis_id = ?", [analysis_id])
+        conn.execute("DELETE FROM analysis_groups WHERE analysis_id = ?", [analysis_id])
+        if groups:
+            conn.executemany(
+                """
+                INSERT INTO analysis_groups(
+                    analysis_id, group_key, group_values_json, is_observed, is_viable, is_selected,
+                    n_rows_raw, n_rows_after_outlier, viability_reasons_json, skip_reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    [
+                        analysis_id,
+                        str(g["group_key"]),
+                        to_json(g.get("group_values", {})),
+                        1 if g.get("is_observed") else 0,
+                        1 if g.get("is_viable") else 0,
+                        1 if g.get("is_selected") else 0,
+                        int(g.get("n_rows_raw", 0)),
+                        int(g.get("n_rows_raw", 0)),
+                        to_json(g.get("viability_reasons", [])),
+                        str(g.get("skip_reason", "")),
+                        now,
+                    ]
+                    for g in groups
+                ],
+            )
+        if row_group_map:
+            conn.executemany(
+                """
+                INSERT INTO analysis_group_rows(
+                    analysis_id, row_index, group_key, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                [
+                    [analysis_id, int(r["row_index"]), str(r["group_key"]), now]
+                    for r in row_group_map
+                ],
+            )
+        conn.commit()
+
+
+def load_analysis_groups(
+    db_path: str,
+    analysis_id: int,
+    selected_only: bool = False,
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM analysis_groups WHERE analysis_id = ?"
+    params: list[Any] = [analysis_id]
+    if selected_only:
+        sql += " AND is_selected = 1"
+    sql += " ORDER BY is_selected DESC, n_rows_raw DESC, group_key"
+    rows = fetchall(db_path, sql, params)
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        rec = dict(r)
+        rec["group_values"] = from_json(rec.get("group_values_json"), {})
+        rec["viability_reasons"] = from_json(rec.get("viability_reasons_json"), [])
+        rec["is_observed"] = bool(rec.get("is_observed"))
+        rec["is_viable"] = bool(rec.get("is_viable"))
+        rec["is_selected"] = bool(rec.get("is_selected"))
+        out.append(rec)
+    return out
+
+
+def load_analysis_group_row_map(
+    db_path: str,
+    analysis_id: int,
+    selected_only: bool = True,
+) -> dict[str, set[int]]:
+    if selected_only:
+        rows = fetchall(
+            db_path,
+            """
+            SELECT agr.row_index, agr.group_key
+            FROM analysis_group_rows agr
+            JOIN analysis_groups ag ON ag.analysis_id = agr.analysis_id AND ag.group_key = agr.group_key
+            WHERE agr.analysis_id = ? AND ag.is_selected = 1
+            """,
+            [analysis_id],
+        )
+    else:
+        rows = fetchall(
+            db_path,
+            "SELECT row_index, group_key FROM analysis_group_rows WHERE analysis_id = ?",
+            [analysis_id],
+        )
+    out: dict[str, set[int]] = {}
+    for r in rows:
+        out.setdefault(str(r["group_key"]), set()).add(int(r["row_index"]))
+    return out
+
+
+def update_group_post_outlier_counts(
+    db_path: str,
+    analysis_id: int,
+    excluded_rows: set[int] | None = None,
+) -> dict[str, int]:
+    groups = load_analysis_groups(db_path, analysis_id, selected_only=False)
+    row_map = load_analysis_group_row_map(db_path, analysis_id, selected_only=False)
+    if excluded_rows is None:
+        excluded_rows = excluded_row_indices(db_path, analysis_id)
+    updates: list[tuple[int, int, str]] = []
+    out: dict[str, int] = {}
+    for g in groups:
+        key = str(g["group_key"])
+        rows = row_map.get(key, set())
+        if not g.get("is_observed"):
+            n_after = 0
+        else:
+            n_after = len(rows.difference(excluded_rows))
+        out[key] = int(n_after)
+        updates.append((int(n_after), int(analysis_id), key))
+    if updates:
+        with get_conn(db_path) as conn:
+            conn.executemany(
+                """
+                UPDATE analysis_groups
+                SET n_rows_after_outlier = ?
+                WHERE analysis_id = ? AND group_key = ?
+                """,
+                updates,
+            )
+            conn.commit()
+    return out
 
 
 def compute_univariate_screening(
@@ -493,6 +875,7 @@ def compute_health_checks(
     group_variables: list[str],
     min_rows: int,
     min_rows_per_group: int,
+    group_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     rows = int(len(df))
     checks: list[dict[str, Any]] = []
@@ -511,19 +894,42 @@ def compute_health_checks(
         checks.append({"name": "response_numeric", "passed": valid >= min_rows, "detail": f"Numeric response rows={valid}"})
 
     if group_variables:
-        temp = df[group_variables].fillna("__NA__")
-        group_sizes = temp.groupby(group_variables).size().reset_index(name="count")
-        min_group = int(group_sizes["count"].min()) if len(group_sizes) else 0
+        if group_summary:
+            min_group = int(group_summary.get("min_group_size_raw", 0))
+            detail = (
+                f"Min group size={min_group}, required>={min_rows_per_group}; "
+                f"selected={int(group_summary.get('selected_group_count', 0))}/"
+                f"{int(group_summary.get('group_count_total', 0))}; "
+                f"coverage={float(group_summary.get('coverage_rows', 0.0)) * 100:.1f}%"
+            )
+        else:
+            temp = df[group_variables].fillna("__NA__")
+            group_sizes = temp.groupby(group_variables).size().reset_index(name="count")
+            min_group = int(group_sizes["count"].min()) if len(group_sizes) else 0
+            detail = f"Min group size={min_group}, required>={min_rows_per_group}"
         checks.append(
             {
                 "name": "group_size",
                 "passed": min_group >= min_rows_per_group,
-                "detail": f"Min group size={min_group}, required>={min_rows_per_group}",
+                "detail": detail,
             }
         )
+        if group_summary:
+            selected_groups = int(group_summary.get("selected_group_count", 0))
+            checks.append(
+                {
+                    "name": "group_selection",
+                    "passed": selected_groups > 0,
+                    "detail": (
+                        f"Selected groups={selected_groups}; non-viable skipped={int(group_summary.get('skipped_non_viable_count', 0))}; "
+                        f"limit-skipped={int(group_summary.get('skipped_limit_count', 0))}"
+                    ),
+                }
+            )
     return {
         "rows": rows,
         "group_variables": group_variables,
+        "group_summary": group_summary or {},
         "checks": checks,
         "all_passed": all(c["passed"] for c in checks),
     }
@@ -544,9 +950,15 @@ def detect_group_outliers(
     if work.empty:
         return []
 
-    groups = [("__ALL__", work)] if not group_variables else list(work.groupby(group_variables))
+    if group_variables:
+        for col in group_variables:
+            work[col] = work[col].map(_stringify_group_value)
+        grouped = list(work.groupby(group_variables, sort=False))
+    else:
+        grouped = [("__ALL__", work)]
+
     flagged: list[dict[str, Any]] = []
-    for key, grp in groups:
+    for key, grp in grouped:
         values = grp["_response"]
         med = np.median(values)
         mad = np.median(np.abs(values - med))
@@ -556,7 +968,10 @@ def detect_group_outliers(
         mask = np.abs(rz) > threshold
         if not mask.any():
             continue
-        label = "__ALL__" if key == "__ALL__" else str(key)
+        if key == "__ALL__":
+            label = "__ALL__"
+        else:
+            label = _group_key_from_values(group_variables, _group_values_from_parts(group_variables, key))
         for row_idx, z in zip(grp.loc[mask, "row_index"], rz[mask]):
             flagged.append(
                 {

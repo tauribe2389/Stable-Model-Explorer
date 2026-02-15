@@ -96,10 +96,43 @@ def ensure_db(db_path: str) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_outliers_analysis ON analysis_outliers(analysis_id);
 
+            CREATE TABLE IF NOT EXISTS analysis_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                analysis_id INTEGER NOT NULL,
+                group_key TEXT NOT NULL,
+                group_values_json TEXT NOT NULL,
+                is_observed INTEGER NOT NULL DEFAULT 1,
+                is_viable INTEGER NOT NULL DEFAULT 1,
+                is_selected INTEGER NOT NULL DEFAULT 1,
+                n_rows_raw INTEGER NOT NULL DEFAULT 0,
+                n_rows_after_outlier INTEGER NOT NULL DEFAULT 0,
+                viability_reasons_json TEXT NOT NULL DEFAULT '[]',
+                skip_reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE(analysis_id, group_key),
+                FOREIGN KEY(analysis_id) REFERENCES analyses(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_analysis_groups_analysis ON analysis_groups(analysis_id);
+            CREATE INDEX IF NOT EXISTS idx_analysis_groups_selected ON analysis_groups(analysis_id, is_selected);
+
+            CREATE TABLE IF NOT EXISTS analysis_group_rows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                analysis_id INTEGER NOT NULL,
+                row_index INTEGER NOT NULL,
+                group_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(analysis_id, row_index),
+                FOREIGN KEY(analysis_id) REFERENCES analyses(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_analysis_group_rows_analysis ON analysis_group_rows(analysis_id);
+            CREATE INDEX IF NOT EXISTS idx_analysis_group_rows_group ON analysis_group_rows(analysis_id, group_key);
+
             CREATE TABLE IF NOT EXISTS model_registry (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 analysis_id INTEGER NOT NULL,
                 model_idx INTEGER NOT NULL,
+                base_model_idx INTEGER NOT NULL DEFAULT 1,
+                group_key TEXT NOT NULL DEFAULT '__ALL__',
                 formula TEXT NOT NULL,
                 model_class TEXT NOT NULL,
                 included_terms_json TEXT NOT NULL,
@@ -118,6 +151,7 @@ def ensure_db(db_path: str) -> None:
                 run_at TEXT NOT NULL,
                 status TEXT NOT NULL,
                 validity_class TEXT NOT NULL,
+                group_key TEXT NOT NULL DEFAULT '__ALL__',
                 invalid_reasons_json TEXT NOT NULL,
                 warnings_json TEXT NOT NULL,
                 metrics_json TEXT NOT NULL,
@@ -163,10 +197,21 @@ def ensure_db(db_path: str) -> None:
         )
         dataset_cols = {r["name"] for r in conn.execute("PRAGMA table_info(datasets)").fetchall()}
         analyses_cols = {r["name"] for r in conn.execute("PRAGMA table_info(analyses)").fetchall()}
+        model_registry_cols = {r["name"] for r in conn.execute("PRAGMA table_info(model_registry)").fetchall()}
+        model_runs_cols = {r["name"] for r in conn.execute("PRAGMA table_info(model_runs)").fetchall()}
         if "updated_at" not in dataset_cols:
             conn.execute("ALTER TABLE datasets ADD COLUMN updated_at TEXT")
         if "updated_at" not in analyses_cols:
             conn.execute("ALTER TABLE analyses ADD COLUMN updated_at TEXT")
+        if "base_model_idx" not in model_registry_cols:
+            conn.execute("ALTER TABLE model_registry ADD COLUMN base_model_idx INTEGER NOT NULL DEFAULT 1")
+        if "group_key" not in model_registry_cols:
+            conn.execute("ALTER TABLE model_registry ADD COLUMN group_key TEXT NOT NULL DEFAULT '__ALL__'")
+        if "group_key" not in model_runs_cols:
+            conn.execute("ALTER TABLE model_runs ADD COLUMN group_key TEXT NOT NULL DEFAULT '__ALL__'")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_model_registry_group ON model_registry(analysis_id, group_key)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_model_runs_group ON model_runs(analysis_id, group_key)")
 
         now = utcnow_iso()
         conn.execute(
@@ -176,6 +221,21 @@ def ensure_db(db_path: str) -> None:
         conn.execute(
             "UPDATE analyses SET updated_at = COALESCE(updated_at, created_at, ?) WHERE updated_at IS NULL OR updated_at = ''",
             [now],
+        )
+
+        # Clean any duplicate model_run rows created by overlapping run requests.
+        conn.execute(
+            """
+            DELETE FROM model_runs
+            WHERE id NOT IN (
+                SELECT MAX(id)
+                FROM model_runs
+                GROUP BY analysis_id, registry_id
+            )
+            """
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_model_runs_analysis_registry ON model_runs(analysis_id, registry_id)"
         )
 
         dataset_dups = conn.execute(

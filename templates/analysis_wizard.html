@@ -1,8 +1,8 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="panel">
-  <h2>2) Analysis Config Wizard (Dataset {{ dataset.id }}: {{ dataset.name }})</h2>
-  <p class="muted">Configure variable governance, outlier policy, model caps, and assumptions handling. This snapshot is persisted for reproducibility.</p>
+  <h2>Analysis Config Wizard</h2>
+  <p class="muted">Dataset: {{ dataset.name }}. Configure variable governance, outlier policy, model caps, and assumptions handling. This snapshot is persisted for reproducibility.</p>
 
   <form method="post">
     <div class="row3">
@@ -48,7 +48,7 @@
         <div class="hint">Multi-select by checking boxes.</div>
       </div>
       <div>
-        <label>Group Variables (for group health + MAD outliers)</label>
+        <label>Group Variables (Population Split Controls)</label>
         <div class="var-box">
           {% for col in categorical %}
             <div class="var-item" data-role="group" data-var="{{ col }}">
@@ -57,7 +57,29 @@
             </div>
           {% endfor %}
         </div>
-        <div class="hint">Primary/group selections are reserved and removed from covariates below.</div>
+        <div class="hint">Group variables partition populations prior to model generation. Group selections are removed from primary/forced/model-term selections.</div>
+        <details class="advanced-panel">
+          <summary>Advanced Group Population Settings</summary>
+          <p class="muted">Observed combinations are used by default. Unobserved combinations can be materialized for sparsity diagnostics and will auto-skip as non-viable.</p>
+          <label><input type="checkbox" name="group_include_unobserved_combinations" {% if config.group_include_unobserved_combinations %}checked{% endif %}> Include unobserved group combinations (diagnostic auto-skip)</label>
+          <div class="row3">
+            <div>
+              <label>Missing Group Value Policy</label>
+              <select name="group_missing_policy">
+                <option value="AS_LEVEL" {% if config.group_missing_policy != 'DROP_ROWS' %}selected{% endif %}>Treat missing as __NA__ level</option>
+                <option value="DROP_ROWS" {% if config.group_missing_policy == 'DROP_ROWS' %}selected{% endif %}>Exclude rows missing any group variable</option>
+              </select>
+            </div>
+            <div>
+              <label>Min Primary Factor Level N (per group)</label>
+              <input type="number" name="group_min_primary_level_n" min="1" value="{{ config.group_min_primary_level_n }}">
+            </div>
+            <div>
+              <label>Max Groups Analyzed (Top N by raw rows)</label>
+              <input type="number" name="group_max_groups_analyzed" min="1" value="{{ config.group_max_groups_analyzed }}">
+            </div>
+          </div>
+        </details>
       </div>
     </div>
 
@@ -89,7 +111,7 @@
         <div class="var-box">
           {% for c in columns %}
             {% if c.model_role != 'excluded' %}
-              <div class="var-item">
+              <div class="var-item" data-role="forced" data-var="{{ c.column_name }}">
                 <input type="checkbox" id="forced_{{ loop.index }}" name="forced_terms" value="{{ c.column_name }}" {% if c.column_name in config.forced_terms %}checked{% endif %}>
                 <label for="forced_{{ loop.index }}">{{ c.column_name }}</label>
               </div>
@@ -186,8 +208,14 @@
 
 <div class="panel">
   <h2>Current Profile Snapshot</h2>
-  <table>
-    <tr><th>Column</th><th>Type</th><th>Role</th><th>Unique</th><th>Exclude Reason</th></tr>
+  <table data-sortable="true">
+    <tr>
+      <th data-sort-type="text">Column</th>
+      <th data-sort-type="text">Type</th>
+      <th data-sort-type="text">Role</th>
+      <th data-sort-type="numeric">Unique</th>
+      <th data-sort-type="text">Exclude Reason</th>
+    </tr>
     {% for c in columns %}
       <tr>
         <td class="mono">{{ c.column_name }}</td>
@@ -207,12 +235,44 @@
         .map(function (cb) { return cb.value; });
     }
 
-    function updateCovariateAvailability() {
-      var reserved = new Set(selectedValues('primary').concat(selectedValues('group')));
+    function updateVariableAvailability() {
+      var primary = selectedValues('primary');
+      var group = selectedValues('group');
+      var responseSelect = document.querySelector('select[name="response"]');
+      var responseName = responseSelect ? responseSelect.value : '';
+      var reservedGroup = new Set(group);
+      var reservedCovariates = new Set(primary.concat(group));
+      var reservedForced = new Set(group);
+      if (responseName) {
+        reservedForced.add(responseName);
+      }
+
+      var primaryItems = document.querySelectorAll('.var-item[data-role="primary"]');
+      primaryItems.forEach(function (item) {
+        var cb = item.querySelector('input[type="checkbox"]');
+        var shouldLock = reservedGroup.has(cb.value);
+        if (shouldLock && cb.checked) {
+          cb.checked = false;
+        }
+        cb.disabled = shouldLock;
+        item.hidden = shouldLock;
+      });
+
       var covariateItems = document.querySelectorAll('.var-item[data-role="cat_cov"], .var-item[data-role="cont_cov"]');
       covariateItems.forEach(function (item) {
         var cb = item.querySelector('input[type="checkbox"]');
-        var shouldLock = reserved.has(cb.value);
+        var shouldLock = reservedCovariates.has(cb.value);
+        if (shouldLock && cb.checked) {
+          cb.checked = false;
+        }
+        cb.disabled = shouldLock;
+        item.hidden = shouldLock;
+      });
+
+      var forcedItems = document.querySelectorAll('.var-item[data-role="forced"]');
+      forcedItems.forEach(function (item) {
+        var cb = item.querySelector('input[type="checkbox"]');
+        var shouldLock = reservedForced.has(cb.value);
         if (shouldLock && cb.checked) {
           cb.checked = false;
         }
@@ -221,11 +281,11 @@
       });
     }
 
-    var primaryAndGroup = document.querySelectorAll('.var-item[data-role="primary"] input[type="checkbox"], .var-item[data-role="group"] input[type="checkbox"]');
-    primaryAndGroup.forEach(function (cb) {
-      cb.addEventListener('change', updateCovariateAvailability);
+    var watches = document.querySelectorAll('.var-item[data-role="primary"] input[type="checkbox"], .var-item[data-role="group"] input[type="checkbox"], select[name="response"]');
+    watches.forEach(function (el) {
+      el.addEventListener('change', updateVariableAvailability);
     });
-    updateCovariateAvailability();
+    updateVariableAvailability();
   })();
 </script>
 {% endblock %}

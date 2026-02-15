@@ -3,24 +3,25 @@
 {% set current_tab = 'outliers' %}
 {% include "_analysis_tabs.html" %}
 <div class="panel">
-  <h2>4) Outlier Review (Analysis {{ analysis.id }})</h2>
+  <h2>Outlier Review</h2>
+  <p class="muted">Potential outliers are data points that may disproportionately affect model results. Review flagged observations to decide whether to include or exclude them from modeling.</p>
 </div>
 
 <div class="panel">
   <form method="post">
-    <p class="muted">Outliers flagged by robust z-score using MAD within selected groups. No per-model silent removals occur.</p>
-    <table>
+    <table data-sortable="true">
       <tr>
-        <th>row_index</th><th>group</th><th>variable</th><th>robust_z</th><th>reason</th><th>decision</th>
+        <th data-sort-type="numeric">Row Index</th>
+        <th data-sort-type="text">Population Group</th>
+        <th data-sort-type="numeric" title="Outlier detection uses Median Absolute Deviation (MAD), a robust dispersion estimator designed for stability under non-normal data.&#10;Observations exceeding ±3.5 MAD-based Z-scores are classified as statistically atypical.">MAD Z-Score</th>
+        <th data-sort-type="text">Decision</th>
       </tr>
       {% for o in outliers %}
         <tr>
           <td class="mono">{{ o.row_index }}</td>
           <td class="mono">{{ o.group_key }}</td>
-          <td>{{ o.variable }}</td>
           <td>{{ "%.3f"|format(o.robust_z) }}</td>
-          <td>{{ o.reason }}</td>
-          <td>
+          <td data-sort-value="{{ o.decision }}">
             <select name="decision_{{ o.row_index }}">
               <option value="keep" {% if o.decision=='keep' %}selected{% endif %}>keep</option>
               <option value="remove" {% if o.decision=='remove' %}selected{% endif %}>remove</option>
@@ -32,8 +33,10 @@
     {% if not outliers %}
       <p>No outliers detected for the configured grouping and threshold.</p>
     {% endif %}
-    <button type="submit" name="action" value="save">Save Decisions</button>
-    <button type="submit" name="action" value="run">Save + Continue to Model Run</button>
+    <div class="outlier-actions">
+      <button type="submit" name="action" value="save">Save Decisions</button>
+      <button type="submit" name="action" value="run">Save + Continue to Model Run</button>
+    </div>
   </form>
 </div>
 {% endblock %}

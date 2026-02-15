@@ -3,7 +3,7 @@
 {% set current_tab = 'report' %}
 {% include "_analysis_tabs.html" %}
 <div class="panel">
-  <h2>8) Report Export (Analysis {{ analysis.id }})</h2>
+  <h2>Report Export</h2>
   <form method="post">
     <button type="submit">Generate HTML + PDF Snapshot</button>
   </form>
@@ -12,8 +12,13 @@
 
 <div class="panel">
   <h3>Snapshots</h3>
-  <table>
-    <tr><th>Created</th><th>HTML</th><th>PDF</th><th>Meta</th></tr>
+  <table data-sortable="true">
+    <tr>
+      <th data-sort-type="text">Created</th>
+      <th data-sort-type="text">HTML</th>
+      <th data-sort-type="text">PDF</th>
+      <th data-sort-type="text">Meta</th>
+    </tr>
     {% for s in snapshots %}
       <tr>
         <td>{{ s.created_at }}</td>

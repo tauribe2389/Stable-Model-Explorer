@@ -3,7 +3,7 @@
 {% set current_tab = 'runs' %}
 {% include "_analysis_tabs.html" %}
 <div class="panel">
-  <h2>6) Model Runs Summary (Analysis {{ analysis.id }})</h2>
+  <h2>Model Runs Summary</h2>
   <div class="card-grid">
     <div class="card"><div class="muted">Total</div><div>{{ counts.total }}</div></div>
     <div class="card"><div class="muted">Valid</div><div>{{ counts.valid }}</div></div>
@@ -24,13 +24,26 @@
 </div>
 
 <div class="panel">
-  <table>
+  <table data-sortable="true">
     <tr>
-      <th>#</th><th>Class</th><th>Status</th><th>Validity</th><th>n</th><th>R2</th><th>Max VIF</th><th>BP p</th><th>High Cook Count</th><th>Failures</th><th>Warnings</th><th>Formula</th>
+      <th data-sort-type="numeric">#</th>
+      <th data-sort-type="text">Group</th>
+      <th data-sort-type="text">Class</th>
+      <th data-sort-type="text">Status</th>
+      <th data-sort-type="text">Validity</th>
+      <th data-sort-type="numeric">n</th>
+      <th data-sort-type="numeric">R2</th>
+      <th data-sort-type="numeric">Max VIF</th>
+      <th data-sort-type="numeric">BP p</th>
+      <th data-sort-type="numeric">High Cook Count</th>
+      <th data-sort-type="text">Failures</th>
+      <th data-sort-type="text">Warnings</th>
+      <th data-sort-type="text">Formula</th>
     </tr>
     {% for r in runs %}
       <tr>
         <td>{{ r.model_idx }}</td>
+        <td class="mono">{{ r.group_key }}</td>
         <td>{{ r.model_class }}</td>
         <td>{{ r.status }}</td>
         <td>

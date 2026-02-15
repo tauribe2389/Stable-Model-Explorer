@@ -1,11 +1,17 @@
 <div class="analysis-tabs-wrap">
-  <nav class="analysis-tabs">
-    <a class="analysis-tab {% if current_tab == 'overview' %}active{% endif %}" href="{{ url_for('sme.analysis_overview', analysis_id=analysis.id) }}">Overview</a>
-    <a class="analysis-tab {% if current_tab == 'outliers' %}active{% endif %}" href="{{ url_for('sme.outlier_review', analysis_id=analysis.id) }}">Outliers</a>
-    <a class="analysis-tab {% if current_tab == 'registry' %}active{% endif %}" href="{{ url_for('sme.model_registry', analysis_id=analysis.id) }}">Registry</a>
-    <a class="analysis-tab {% if current_tab == 'run' %}active{% endif %}" href="{{ url_for('sme.run_models', analysis_id=analysis.id) }}">Run</a>
-    <a class="analysis-tab {% if current_tab == 'runs' %}active{% endif %}" href="{{ url_for('sme.model_runs_summary', analysis_id=analysis.id) }}">Runs</a>
-    <a class="analysis-tab {% if current_tab == 'stability' %}active{% endif %}" href="{{ url_for('sme.stability_dashboard', analysis_id=analysis.id) }}">Stability</a>
-    <a class="analysis-tab {% if current_tab == 'report' %}active{% endif %}" href="{{ url_for('sme.report_export', analysis_id=analysis.id) }}">Report</a>
-  </nav>
+  <div class="analysis-tabs">
+    <div class="analysis-context">
+      <div class="analysis-context-label">Analysis</div>
+      <div class="analysis-context-name">{{ analysis.name }}</div>
+    </div>
+    <nav class="analysis-tabs-nav">
+      <a class="analysis-tab {% if current_tab == 'overview' %}active{% endif %}" href="{{ url_for('sme.analysis_overview', analysis_id=analysis.id) }}">Overview</a>
+      <a class="analysis-tab {% if current_tab == 'outliers' %}active{% endif %}" href="{{ url_for('sme.outlier_review', analysis_id=analysis.id) }}">Outliers</a>
+      <a class="analysis-tab {% if current_tab == 'registry' %}active{% endif %}" href="{{ url_for('sme.model_registry', analysis_id=analysis.id) }}">Registry</a>
+      <a class="analysis-tab {% if current_tab == 'run' %}active{% endif %}" href="{{ url_for('sme.run_models', analysis_id=analysis.id) }}">Run</a>
+      <a class="analysis-tab {% if current_tab == 'runs' %}active{% endif %}" href="{{ url_for('sme.model_runs_summary', analysis_id=analysis.id) }}">Runs</a>
+      <a class="analysis-tab {% if current_tab == 'stability' %}active{% endif %}" href="{{ url_for('sme.stability_dashboard', analysis_id=analysis.id) }}">Effects</a>
+      <a class="analysis-tab {% if current_tab == 'report' %}active{% endif %}" href="{{ url_for('sme.report_export', analysis_id=analysis.id) }}">Report</a>
+    </nav>
+  </div>
 </div>

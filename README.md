@@ -44,6 +44,12 @@ Open `http://127.0.0.1:5000`.
 
 3. **Analysis Config Wizard**
 - Choose response, primary factors, group variables, covariates, forced terms, interactions.
+- Group variables act as population split controls: models are generated and run per selected observed group combination.
+- Advanced group options:
+  - include unobserved combinations for sparsity diagnostics (auto-skipped as non-viable),
+  - missing group policy (`AS_LEVEL` as `__NA__` or `DROP_ROWS`),
+  - minimum primary-factor level size per group,
+  - auto-limit to top N groups by raw row count (with coverage reporting).
 - Define model universe caps and assumption/diagnostic thresholds.
 - Save configuration presets.
 - On submit, the app computes:
@@ -57,7 +63,7 @@ Open `http://127.0.0.1:5000`.
 - Explicit keep/remove decision per flagged row (`row_index` persisted).
 
 5. **Model Registry**
-- Generated candidate formula universe with forced terms + all-subsets under caps.
+- Generated candidate formula universe with forced terms + all-subsets under caps, materialized per selected `group_key`.
 - If combinations exceed `max_total_models`, deterministic random sampling with saved seed.
 
 6. **Model Runs Summary**
@@ -84,7 +90,10 @@ Open `http://127.0.0.1:5000`.
   - `CONDITIONAL`
   - `NON_EFFECT`
   - `REDFLAG`
-- Stratified summaries by model class (`ANOVA` vs `ANCOVA`) plus combined.
+- Per-group buckets plus combined weighted summaries.
+- Combined weighting uses normalized cross-weighting from:
+  - row share by group (`rows_after_outlier / total_rows`),
+  - model quality share by group (`valid_models_in_group / total_models_in_group`).
 
 8. **Report Export**
 - HTML + PDF snapshot with config, checks, registry/runs, and stability summaries.
@@ -115,6 +124,9 @@ Artifacts:
 - Breusch-Pagan alpha: `0.05`
 - Shapiro fail alpha: `0.01` (warn alpha: `0.05`)
 - MAD outlier threshold: `3.5`
+- Group missing policy: `AS_LEVEL`
+- Group max analyzed (top N): `25`
+- Group min primary-factor level count per group: `5`
 - Stable sign consistency: `0.9`
 - Stable practical significance rate: `0.8`
 - Non-effect rate threshold: `0.8`

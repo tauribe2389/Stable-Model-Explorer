@@ -4,7 +4,7 @@
 {% include "_analysis_tabs.html" %}
 <div class="panel">
   <h2>Analysis Overview</h2>
-  <p class="muted">Name: {{ analysis.name }} | Dataset: {{ dataset.name }} | Status: {{ analysis.status }}</p>
+  <p class="muted">Dataset: {{ dataset.name }} | Status: {{ analysis.status }}</p>
 </div>
 
 <div class="panel">
@@ -21,6 +21,15 @@
     <div class="config-card">
       <div class="muted">Grouping Variables</div>
       <div>{{ config_summary.group_variables|join(', ') if config_summary.group_variables else '(none)' }}</div>
+    </div>
+    <div class="config-card">
+      <div class="muted">Group Controls</div>
+      <div class="mono">
+        missing={{ config_summary.group_settings.missing_policy }},
+        unobserved={{ 'yes' if config_summary.group_settings.include_unobserved else 'no' }},
+        top_n={{ config_summary.group_settings.max_groups_analyzed }},
+        min_level_n={{ config_summary.group_settings.min_primary_level_n }}
+      </div>
     </div>
     <div class="config-card">
       <div class="muted">Categorical Covariates</div>

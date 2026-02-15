@@ -37,5 +37,209 @@
       });
     })();
   </script>
+  <script>
+    (function () {
+      var MISSING_TOKENS = new Set(["", "-", "--", "—", "n/a", "na", "null", "none", "(none)"]);
+      var BUCKET_ORDER = {
+        stable: 0,
+        conditional: 1,
+        noneffect: 2,
+        redflag: 3
+      };
+
+      function cleanText(value) {
+        return String(value || "").replace(/\s+/g, " ").trim();
+      }
+
+      function isMissing(value) {
+        return MISSING_TOKENS.has(cleanText(value).toLowerCase());
+      }
+
+      function parseNumber(value) {
+        var text = cleanText(value).replace(/,/g, "").replace(/%$/, "");
+        if (!/^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/.test(text)) {
+          return null;
+        }
+        var numeric = Number(text);
+        return Number.isFinite(numeric) ? numeric : null;
+      }
+
+      function normalizeBucket(value) {
+        return cleanText(value).toLowerCase().replace(/[_\-\s]/g, "");
+      }
+
+      function getCellSortValue(cell) {
+        if (!cell) return "";
+        var select = cell.querySelector("select");
+        if (select) {
+          return select.value || "";
+        }
+        if (cell.dataset && Object.prototype.hasOwnProperty.call(cell.dataset, "sortValue")) {
+          return cell.dataset.sortValue;
+        }
+        return cleanText(cell.textContent);
+      }
+
+      function compareText(aText, bText, direction) {
+        var result = aText.localeCompare(bText, undefined, { sensitivity: "base" });
+        return direction === "desc" ? -result : result;
+      }
+
+      function compareValues(aRaw, bRaw, sortType, direction) {
+        var aMissing = isMissing(aRaw);
+        var bMissing = isMissing(bRaw);
+        if (aMissing !== bMissing) {
+          return aMissing ? 1 : -1;
+        }
+        if (aMissing && bMissing) {
+          return 0;
+        }
+
+        if (sortType === "numeric") {
+          var aNum = parseNumber(aRaw);
+          var bNum = parseNumber(bRaw);
+          var aNumMissing = aNum === null;
+          var bNumMissing = bNum === null;
+          if (aNumMissing !== bNumMissing) {
+            return aNumMissing ? 1 : -1;
+          }
+          if (aNumMissing && bNumMissing) {
+            return 0;
+          }
+          if (aNum === bNum) {
+            return 0;
+          }
+          return direction === "desc" ? (aNum < bNum ? 1 : -1) : (aNum < bNum ? -1 : 1);
+        }
+
+        if (sortType === "bucket") {
+          var aBucketKey = normalizeBucket(aRaw);
+          var bBucketKey = normalizeBucket(bRaw);
+          var aRank = Object.prototype.hasOwnProperty.call(BUCKET_ORDER, aBucketKey) ? BUCKET_ORDER[aBucketKey] : 99;
+          var bRank = Object.prototype.hasOwnProperty.call(BUCKET_ORDER, bBucketKey) ? BUCKET_ORDER[bBucketKey] : 99;
+          if (aRank !== bRank) {
+            return direction === "desc" ? bRank - aRank : aRank - bRank;
+          }
+          return compareText(cleanText(aRaw), cleanText(bRaw), direction);
+        }
+
+        return compareText(cleanText(aRaw), cleanText(bRaw), direction);
+      }
+
+      function collectBundles(rows, bundleMode) {
+        var bundles = [];
+        for (var i = 0; i < rows.length; i += 1) {
+          var row = rows[i];
+          if (bundleMode === "recipe") {
+            if (row.classList.contains("lineage-inline-row")) {
+              continue;
+            }
+            var bundleRows = [row];
+            var targetId = row.getAttribute("data-recipe-target");
+            var next = rows[i + 1];
+            if (targetId && next && next.id === targetId && next.classList.contains("lineage-inline-row")) {
+              bundleRows.push(next);
+              i += 1;
+            }
+            bundles.push({ primary: row, rows: bundleRows });
+            continue;
+          }
+          bundles.push({ primary: row, rows: [row] });
+        }
+        return bundles;
+      }
+
+      function setHeaderState(headerCells, activeIndex, direction) {
+        headerCells.forEach(function (cell, index) {
+          cell.classList.remove("is-sorted-asc", "is-sorted-desc");
+          if (cell.classList.contains("is-sortable")) {
+            cell.setAttribute("aria-sort", "none");
+          }
+          if (index === activeIndex) {
+            cell.classList.add(direction === "desc" ? "is-sorted-desc" : "is-sorted-asc");
+            if (cell.classList.contains("is-sortable")) {
+              cell.setAttribute("aria-sort", direction === "desc" ? "descending" : "ascending");
+            }
+          }
+        });
+      }
+
+      function sortTable(table, state) {
+        var headerRow = state.headerRow;
+        var section = headerRow.parentElement;
+        if (!section) return;
+        var rows = Array.from(section.children).filter(function (row) { return row.tagName === "TR"; });
+        var headerIndex = rows.indexOf(headerRow);
+        if (headerIndex < 0) return;
+        var bodyRows = rows.slice(headerIndex + 1);
+        if (!bodyRows.length) return;
+
+        var bundles = collectBundles(bodyRows, table.getAttribute("data-sort-bundle"));
+        var decorated = bundles.map(function (bundle, currentIndex) {
+          return { bundle: bundle, currentIndex: currentIndex };
+        });
+
+        var sortType = (state.headerCells[state.activeIndex].getAttribute("data-sort-type") || "text").toLowerCase();
+        decorated.sort(function (left, right) {
+          var leftCell = left.bundle.primary.cells[state.activeIndex];
+          var rightCell = right.bundle.primary.cells[state.activeIndex];
+          var cmp = compareValues(getCellSortValue(leftCell), getCellSortValue(rightCell), sortType, state.direction);
+          if (cmp !== 0) return cmp;
+          return left.currentIndex - right.currentIndex;
+        });
+
+        var fragment = document.createDocumentFragment();
+        decorated.forEach(function (item) {
+          item.bundle.rows.forEach(function (row) {
+            fragment.appendChild(row);
+          });
+        });
+        section.appendChild(fragment);
+      }
+
+      function initSortableTable(table) {
+        var headerRow = Array.from(table.rows).find(function (row) { return row.querySelector("th"); });
+        if (!headerRow) return;
+
+        var headerCells = Array.from(headerRow.querySelectorAll("th"));
+        if (!headerCells.length) return;
+
+        var state = {
+          headerRow: headerRow,
+          headerCells: headerCells,
+          activeIndex: -1,
+          direction: "asc"
+        };
+
+        headerCells.forEach(function (cell, index) {
+          if ((cell.getAttribute("data-sortable") || "").toLowerCase() === "false") {
+            return;
+          }
+          cell.classList.add("is-sortable");
+          cell.setAttribute("role", "button");
+          cell.setAttribute("tabindex", "0");
+          cell.setAttribute("aria-sort", "none");
+          cell.addEventListener("click", function () {
+            if (state.activeIndex === index) {
+              state.direction = state.direction === "asc" ? "desc" : "asc";
+            } else {
+              var firstDirection = (cell.getAttribute("data-sort-default") || "asc").toLowerCase();
+              state.activeIndex = index;
+              state.direction = firstDirection === "desc" ? "desc" : "asc";
+            }
+            setHeaderState(headerCells, state.activeIndex, state.direction);
+            sortTable(table, state);
+          });
+          cell.addEventListener("keydown", function (event) {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            event.preventDefault();
+            cell.click();
+          });
+        });
+      }
+
+      document.querySelectorAll("table[data-sortable='true']").forEach(initSortableTable);
+    })();
+  </script>
 </body>
 </html>

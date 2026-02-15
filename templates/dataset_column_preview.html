@@ -80,8 +80,8 @@
   <details>
     <summary>Example Observations (first {{ sample_rows }} non-null)</summary>
     <p class="muted">Example rows to verify formatting, casing, and encoding consistency.</p>
-    <table>
-      <tr><th>row_index</th><th>{{ column_name }}</th></tr>
+    <table data-sortable="true">
+      <tr><th data-sort-type="numeric">row_index</th><th data-sort-type="text">{{ column_name }}</th></tr>
       {% for row in preview.sample_rows %}
         <tr>
           <td class="mono">{{ row.row_index }}</td>

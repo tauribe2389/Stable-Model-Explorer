@@ -3,20 +3,25 @@
 {% set current_tab = 'stability' %}
 {% include "_analysis_tabs.html" %}
 <div class="panel">
-  <h2>7) Stability Dashboard (Analysis {{ analysis.id }})</h2>
+  <h2>Effect Dashboard</h2>
   <form method="post">
     <label><input type="checkbox" name="include_robust" {% if config.include_robust_in_stability %}checked{% endif %}> Include valid-with-robust-SE models</label>
     <button type="submit">Run Stability Analysis</button>
   </form>
-  <p class="muted">Buckets: Stable / Conditional / Non-effect / Red-flag.</p>
-  <p><a href="{{ url_for('sme.model_runs_summary', analysis_id=analysis.id) }}">Back to model runs</a></p>
+  {% if group_summary %}
+    <p class="muted">
+      Showing {{ group_summary.selected_group_count or 0 }} of {{ group_summary.group_count_total or 0 }} groups
+      (coverage: {{ '%.1f'|format((group_summary.coverage_rows or 0) * 100) }}% of rows).
+    </p>
+  {% endif %}
 </div>
 
 {% if stability %}
   <div class="panel">
-    <h3>Separation of Effects Summary</h3>
+    <h3>Combined Separation Of Effects</h3>
     <div class="card-grid">
       <div class="card"><div class="muted">Models Used</div><div>{{ stability.summary.n_models_used }}</div></div>
+      <div class="card"><div class="muted">Groups</div><div>{{ stability.summary.selected_group_count }}</div></div>
       <div class="card"><div class="muted">Stable</div><div>{{ stability.summary.bucket_counts.STABLE }}</div></div>
       <div class="card"><div class="muted">Conditional</div><div>{{ stability.summary.bucket_counts.CONDITIONAL }}</div></div>
       <div class="card"><div class="muted">Non-effect</div><div>{{ stability.summary.bucket_counts.NON_EFFECT }}</div></div>
@@ -27,32 +32,125 @@
   </div>
 
   <div class="panel">
-    <h3>Term-Level Stability Table</h3>
-    <p class="muted">Click the chart icon to view the effect distribution or rank stability plot for that row.</p>
-    <table>
+    <h3>Effect Lineage Matrix</h3>
+    <p class="muted">Shows how combined effects are composed from group effects. Click a row to expand the composition drawer inline.</p>
+    {% if lineage_mock.rows %}
+      <div class="table-wrap">
+        <table class="lineage-matrix" data-sortable="true" data-sort-bundle="recipe">
+          <tr>
+            <th class="lineage-col-effect" data-sort-type="text">Effect</th>
+            <th class="lineage-col-type" data-sort-type="text">Type</th>
+            <th class="lineage-col-lineage" data-sort-type="text">Lineage Tag</th>
+            <th data-sort-type="bucket">Combined</th>
+            {% for gh in lineage_mock.group_headers %}
+              <th data-sort-type="bucket">
+                <div class="mono">{{ gh.group_key }}</div>
+                <div class="weight-mini-bar"><span style="width: {{ '%.1f'|format((gh.weight_normalized or 0) * 100) }}%;"></span></div>
+                <div class="muted">{{ '%.2f'|format(gh.weight_normalized or 0) }}</div>
+              </th>
+            {% endfor %}
+            <th data-sortable="false">Recipe</th>
+          </tr>
+          {% for row in lineage_mock.rows %}
+            <tr class="lineage-row" data-recipe-target="{{ row.recipe_id }}">
+              <td class="mono">{{ row.effect_id }}</td>
+              <td title="{{ row.effect_type_tooltip }}"><span class="lineage-type-text">{{ row.effect_type }}</span></td>
+              <td><span class="lineage-tag" title="{{ row.lineage_note }}">{{ row.lineage_tag }}</span></td>
+              <td>
+                {% if row.combined_bucket %}
+                  <span class="bucket-chip bucket-{{ row.combined_bucket|lower|replace('_', '-') }}" title="{{ row.combined_bucket_tooltip }}">{{ row.combined_bucket }}</span>
+                {% else %}
+                  <span class="muted">-</span>
+                {% endif %}
+              </td>
+              {% for gc in row.group_cells %}
+                <td>
+                  {% if gc.bucket %}
+                    <span class="bucket-chip bucket-{{ gc.bucket|lower|replace('_', '-') }}" title="{{ gc.bucket_tooltip }}">{{ gc.bucket }}</span>
+                  {% else %}
+                    <span class="muted">-</span>
+                  {% endif %}
+                </td>
+              {% endfor %}
+              <td><button type="button" class="link-btn lineage-recipe-btn" data-recipe-target="{{ row.recipe_id }}">View</button></td>
+            </tr>
+            <tr class="lineage-inline-row" id="{{ row.recipe_id }}" hidden>
+              <td colspan="{{ 5 + (lineage_mock.group_headers|length) }}">
+                <div class="lineage-inline-card">
+                  <div><strong class="mono">{{ row.effect_id }}</strong></div>
+                  <div class="muted">Lineage: {{ row.lineage_tag }}. {{ row.lineage_note }}</div>
+                  <div class="muted">
+                    Combined: {% if row.combined_bucket %}{{ row.combined_bucket }}{% else %}-{% endif %} |
+                    Factor: {{ row.factor_name }} {% if row.level_a %}| Levels: {{ row.level_a }} {% if row.level_b %}vs {{ row.level_b }}{% endif %}{% endif %}
+                  </div>
+                  <table data-sortable="true">
+                    <tr>
+                      <th data-sort-type="text">Group</th>
+                      <th data-sort-type="numeric">Weight (norm)</th>
+                      <th data-sort-type="text">Contributes</th>
+                      <th data-sort-type="bucket">Group Bucket</th>
+                      <th data-sortable="false">Plot</th>
+                      <th data-sort-type="numeric">Median</th>
+                      <th data-sort-type="numeric">IQR</th>
+                      <th data-sort-type="numeric">Rows</th>
+                      <th data-sort-type="text">Valid/Total Models</th>
+                    </tr>
+                    {% for c in row.contributors %}
+                      <tr>
+                        <td class="mono">{{ c.group_key }}</td>
+                        <td>{{ '%.3f'|format(c.weight_normalized or 0) }}</td>
+                        <td>{{ 'yes' if c.contributes else 'no' }}</td>
+                        <td>
+                          {% if c.bucket %}
+                            <span class="bucket-chip bucket-{{ c.bucket|lower|replace('_', '-') }}" title="{{ c.bucket_tooltip }}">{{ c.bucket }}</span>
+                          {% else %}
+                            <span class="muted">-</span>
+                          {% endif %}
+                        </td>
+                        <td>
+                          {% if c.plot_path %}
+                            <a class="plot-icon-btn" href="{{ url_for('sme.view_artifact', path=c.plot_path) }}" target="_blank" title="View group effect plot">&#128202;</a>
+                          {% else %}
+                            <span class="muted">-</span>
+                          {% endif %}
+                        </td>
+                        <td>{% if c.median is not none %}{{ '%.4f'|format(c.median) }}{% else %}<span class="muted">-</span>{% endif %}</td>
+                        <td>{% if c.iqr is not none %}{{ '%.4f'|format(c.iqr) }}{% else %}<span class="muted">-</span>{% endif %}</td>
+                        <td>{{ c.n_rows_after_outlier }}</td>
+                        <td>{{ c.n_models_valid }} / {{ c.n_models_total }}</td>
+                      </tr>
+                    {% endfor %}
+                  </table>
+                </div>
+              </td>
+            </tr>
+          {% endfor %}
+        </table>
+      </div>
+    {% else %}
+      <p class="muted">No lineage rows available yet.</p>
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h3>Group Weights</h3>
+    <table data-sortable="true">
       <tr>
-        <th>Plot</th><th>Effect ID</th><th>Type</th><th>Factor</th><th>Levels</th><th>Median</th><th>IQR</th><th>Sign Consistency</th><th>Practical Rate</th><th>Equivalence Rate</th><th>Bucket</th><th>Narrative</th>
+        <th data-sort-type="text">Group</th>
+        <th data-sort-type="numeric">Rows After Outlier</th>
+        <th data-sort-type="numeric">Total Models</th>
+        <th data-sort-type="numeric">Valid Models</th>
+        <th data-sort-type="numeric">Weight Raw</th>
+        <th data-sort-type="numeric">Weight Normalized</th>
       </tr>
-      {% for e in stability.effects %}
+      {% for w in stability.summary.group_weights %}
         <tr>
-          <td>
-            {% if e.plot_path %}
-              <a class="plot-icon-btn" href="{{ url_for('sme.view_artifact', path=e.plot_path) }}" target="_blank" title="View effect plot">&#128202;</a>
-            {% else %}
-              <span class="muted">-</span>
-            {% endif %}
-          </td>
-          <td class="mono">{{ e.effect_id }}</td>
-          <td>{{ e.effect_type }}</td>
-          <td>{{ e.factor_name }}</td>
-          <td>{{ e.level_a }} {% if e.level_b %}vs {{ e.level_b }}{% endif %}</td>
-          <td>{{ "%.4f"|format(e.estimate_distribution.median) if e.estimate_distribution else '' }}</td>
-          <td>{{ "%.4f"|format(e.estimate_distribution.iqr) if e.estimate_distribution else '' }}</td>
-          <td>{{ e.sign_consistency }}</td>
-          <td>{{ e.practical_rate }}</td>
-          <td>{{ e.equivalence_rate }}</td>
-          <td>{{ e.bucket }}</td>
-          <td>{{ e.narrative }}</td>
+          <td class="mono">{{ w.group_key }}</td>
+          <td>{{ w.n_rows_after_outlier }}</td>
+          <td>{{ w.n_models_total }}</td>
+          <td>{{ w.n_models_valid }}</td>
+          <td>{{ '%.5f'|format(w.weight_raw) }}</td>
+          <td>{{ '%.5f'|format(w.weight_normalized) }}</td>
         </tr>
       {% endfor %}
     </table>
@@ -60,4 +158,45 @@
 {% else %}
   <div class="panel"><p>No stability result yet.</p></div>
 {% endif %}
+<script>
+  (function () {
+    var rows = Array.from(document.querySelectorAll(".lineage-row"));
+    if (!rows.length) return;
+    var buttons = Array.from(document.querySelectorAll(".lineage-recipe-btn"));
+    var cards = Array.from(document.querySelectorAll(".lineage-inline-row"));
+    var activeId = "";
+
+    function showCard(targetId) {
+      cards.forEach(function (card) {
+        card.hidden = card.id !== targetId;
+      });
+      rows.forEach(function (row) {
+        row.classList.toggle("active", row.getAttribute("data-recipe-target") === targetId);
+      });
+      activeId = targetId || "";
+    }
+
+    function toggleTarget(targetId) {
+      if (!targetId) return;
+      if (activeId === targetId) {
+        showCard("");
+      } else {
+        showCard(targetId);
+      }
+    }
+
+    rows.forEach(function (row) {
+      row.addEventListener("click", function (ev) {
+        if (ev.target.closest("button")) return;
+        toggleTarget(row.getAttribute("data-recipe-target"));
+      });
+    });
+    buttons.forEach(function (btn) {
+      btn.addEventListener("click", function (ev) {
+        ev.preventDefault();
+        toggleTarget(btn.getAttribute("data-recipe-target"));
+      });
+    });
+  })();
+</script>
 {% endblock %}

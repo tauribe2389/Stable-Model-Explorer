@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import hashlib
 import random
 from pathlib import Path
 from typing import Any
@@ -16,14 +17,20 @@ from statsmodels.stats.diagnostic import het_breuschpagan
 from statsmodels.stats.outliers_influence import OLSInfluence, variance_inflation_factor
 
 from .db import fetchall, fetchone, from_json, get_conn, to_json, utcnow_iso
-from .profiling import excluded_row_indices, load_dataset_dataframe
+from .profiling import (
+    excluded_row_indices,
+    load_analysis_group_row_map,
+    load_analysis_groups,
+    load_dataset_dataframe,
+    update_group_post_outlier_counts,
+)
 
 matplotlib.use("Agg")
 
 
 def quote_name(name: str) -> str:
-    escaped = name.replace('"', '\\"')
-    return f'Q("{escaped}")'
+    # Use Python repr() so backslashes and quotes are escaped safely for Patsy.
+    return f"Q({str(name)!r})"
 
 
 def term_expr(name: str, categorical_names: set[str]) -> str:
@@ -54,6 +61,7 @@ def generate_model_registry(
     analysis_id: int,
     config: dict[str, Any],
     columns_meta: list[dict[str, Any]],
+    group_keys: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     all_cols = {c["column_name"] for c in columns_meta}
     role_by_col = {c["column_name"]: c["model_role"] for c in columns_meta}
@@ -135,27 +143,46 @@ def generate_model_registry(
     else:
         combos.sort(key=lambda x: x["formula"])
 
-    with get_conn(db_path) as conn:
-        conn.execute("DELETE FROM model_registry WHERE analysis_id = ?", [analysis_id])
-        conn.executemany(
-            """
-            INSERT INTO model_registry(
-                analysis_id, model_idx, formula, model_class, included_terms_json, interactions_json, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)
-            """,
-            [
+    selected_groups = [str(g) for g in (group_keys or []) if str(g).strip()]
+    if not selected_groups:
+        group_rows = load_analysis_groups(db_path, analysis_id, selected_only=True)
+        selected_groups = [str(g["group_key"]) for g in group_rows if str(g.get("group_key", "")).strip()]
+    if not selected_groups:
+        if _as_list(config.get("group_variables")):
+            selected_groups = []
+        else:
+            selected_groups = ["__ALL__"]
+
+    registry_rows: list[list[Any]] = []
+    model_idx = 1
+    for group_key in selected_groups:
+        for base_idx, combo in enumerate(combos, start=1):
+            registry_rows.append(
                 [
                     analysis_id,
-                    idx + 1,
+                    model_idx,
+                    base_idx,
+                    str(group_key),
                     combo["formula"],
                     combo["model_class"],
                     to_json(combo["included_terms"]),
                     to_json(combo["interactions"]),
                     utcnow_iso(),
                 ]
-                for idx, combo in enumerate(combos)
-            ],
-        )
+            )
+            model_idx += 1
+
+    with get_conn(db_path) as conn:
+        conn.execute("DELETE FROM model_registry WHERE analysis_id = ?", [analysis_id])
+        if registry_rows:
+            conn.executemany(
+                """
+                INSERT INTO model_registry(
+                    analysis_id, model_idx, base_model_idx, group_key, formula, model_class, included_terms_json, interactions_json, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
+                """,
+                registry_rows,
+            )
         conn.commit()
     return combos
 
@@ -169,6 +196,8 @@ def load_registry(db_path: str, analysis_id: int) -> list[dict[str, Any]]:
     out = []
     for r in rows:
         rec = dict(r)
+        rec["group_key"] = str(rec.get("group_key") or "__ALL__")
+        rec["base_model_idx"] = int(rec.get("base_model_idx") or rec.get("model_idx") or 0)
         rec["included_terms"] = from_json(rec["included_terms_json"], [])
         rec["interactions"] = from_json(rec["interactions_json"], [])
         out.append(rec)
@@ -181,12 +210,15 @@ def _prepare_dataframe_for_model(
     response: str,
     terms: list[str],
     excluded_rows: set[int],
+    include_rows: set[int] | None = None,
 ) -> pd.DataFrame:
     role_by_col = {c["column_name"]: c["model_role"] for c in columns_meta}
     inferred_by_col = {c["column_name"]: c["inferred_type"] for c in columns_meta}
     keep_cols = ["row_index", response] + [t for t in terms if t != response]
     keep_cols = [c for c in dict.fromkeys(keep_cols) if c in df.columns]
     model_df = df[keep_cols].copy()
+    if include_rows is not None:
+        model_df = model_df[model_df["row_index"].isin(include_rows)]
     if excluded_rows:
         model_df = model_df[~model_df["row_index"].isin(excluded_rows)]
 
@@ -341,6 +373,10 @@ def run_registry_models(
     dataset_id = int(analysis["dataset_id"])
     df = load_dataset_dataframe(db_path, dataset_id)
     excluded_rows = excluded_row_indices(db_path, analysis_id)
+    update_group_post_outlier_counts(db_path, analysis_id, excluded_rows=excluded_rows)
+    group_row_map = load_analysis_group_row_map(db_path, analysis_id, selected_only=True)
+    if not group_row_map:
+        group_row_map = {"__ALL__": {int(x) for x in df["row_index"].tolist()}}
     registry = load_registry(db_path, analysis_id)
     robust_mode = str(config.get("robust_se_mode", "")).strip().upper()
     use_robust = robust_mode in {"HC0", "HC1", "HC2", "HC3"}
@@ -376,7 +412,19 @@ def run_registry_models(
         validity_class = "invalid"
         try:
             terms = reg["included_terms"]
-            model_df = _prepare_dataframe_for_model(df, columns_meta, response, terms, excluded_rows)
+            group_key = str(reg.get("group_key") or "__ALL__")
+            include_rows = group_row_map.get(group_key, set())
+            if not include_rows:
+                invalid_reasons.append(f"No rows available for selected group: {group_key}")
+                raise ValueError("No rows in group")
+            model_df = _prepare_dataframe_for_model(
+                df,
+                columns_meta,
+                response,
+                terms,
+                excluded_rows,
+                include_rows=include_rows,
+            )
             n_obs = int(len(model_df))
             if n_obs < 8:
                 invalid_reasons.append("Insufficient rows after exclusions and NA drop.")
@@ -502,10 +550,27 @@ def run_registry_models(
             conn.execute(
                 """
                 INSERT INTO model_runs(
-                    analysis_id, registry_id, run_at, status, validity_class, invalid_reasons_json, warnings_json,
+                    analysis_id, registry_id, run_at, status, validity_class, group_key, invalid_reasons_json, warnings_json,
                     metrics_json, coeffs_json, pvalues_json, ci_json, anova_json, lsmeans_json, cooks_json,
                     residual_diag_json, artifacts_json, n_obs
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(analysis_id, registry_id) DO UPDATE SET
+                    run_at = excluded.run_at,
+                    status = excluded.status,
+                    validity_class = excluded.validity_class,
+                    group_key = excluded.group_key,
+                    invalid_reasons_json = excluded.invalid_reasons_json,
+                    warnings_json = excluded.warnings_json,
+                    metrics_json = excluded.metrics_json,
+                    coeffs_json = excluded.coeffs_json,
+                    pvalues_json = excluded.pvalues_json,
+                    ci_json = excluded.ci_json,
+                    anova_json = excluded.anova_json,
+                    lsmeans_json = excluded.lsmeans_json,
+                    cooks_json = excluded.cooks_json,
+                    residual_diag_json = excluded.residual_diag_json,
+                    artifacts_json = excluded.artifacts_json,
+                    n_obs = excluded.n_obs
                 """,
                 [
                     analysis_id,
@@ -513,6 +578,7 @@ def run_registry_models(
                     utcnow_iso(),
                     status,
                     validity_class,
+                    str(reg.get("group_key") or "__ALL__"),
                     to_json(invalid_reasons),
                     to_json(warnings),
                     to_json(metrics),
@@ -537,7 +603,15 @@ def list_model_runs(db_path: str, analysis_id: int) -> list[dict[str, Any]]:
     rows = fetchall(
         db_path,
         """
-        SELECT mr.*, rg.model_idx, rg.formula, rg.model_class, rg.included_terms_json, rg.interactions_json
+        SELECT
+            mr.*,
+            COALESCE(mr.group_key, rg.group_key, '__ALL__') AS group_key,
+            rg.model_idx,
+            rg.base_model_idx,
+            rg.formula,
+            rg.model_class,
+            rg.included_terms_json,
+            rg.interactions_json
         FROM model_runs mr
         JOIN model_registry rg ON rg.id = mr.registry_id
         WHERE mr.analysis_id = ?
@@ -548,6 +622,8 @@ def list_model_runs(db_path: str, analysis_id: int) -> list[dict[str, Any]]:
     out = []
     for r in rows:
         rec = dict(r)
+        rec["group_key"] = str(rec.get("group_key") or "__ALL__")
+        rec["base_model_idx"] = int(rec.get("base_model_idx") or rec.get("model_idx") or 0)
         rec["invalid_reasons"] = from_json(rec["invalid_reasons_json"], [])
         rec["warnings"] = from_json(rec["warnings_json"], [])
         rec["metrics"] = from_json(rec["metrics_json"], {})
@@ -647,14 +723,18 @@ def _bucket_effect(
     return "CONDITIONAL", sign_consistency, practical_rate, equivalence_rate
 
 
-def _safe_slug(text: str, max_len: int = 120) -> str:
-    clean = "".join(ch if ch.isalnum() else "_" for ch in str(text))
+def _safe_slug(text: str, max_len: int = 80) -> str:
+    raw = str(text)
+    clean = "".join(ch if ch.isalnum() else "_" for ch in raw)
     while "__" in clean:
         clean = clean.replace("__", "_")
     clean = clean.strip("_")
     if not clean:
         clean = "effect"
-    return clean[:max_len]
+    digest = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:10]
+    head_len = max(8, max_len - len(digest) - 1)
+    clean = clean[:head_len]
+    return f"{clean}_{digest}"
 
 
 def _stability_plot_dir(artifact_dir: str, analysis_id: int) -> Path:
@@ -668,6 +748,7 @@ def _save_effect_distribution_plot(
     effect_id: str,
     values: list[float],
     x_label: str,
+    name_prefix: str = "",
 ) -> str | None:
     if not values:
         return None
@@ -691,7 +772,8 @@ def _save_effect_distribution_plot(
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
 
-    filename = f"{_safe_slug(effect_id)}_distribution.png"
+    slug_source = f"{name_prefix}:{effect_id}" if name_prefix else effect_id
+    filename = f"{_safe_slug(slug_source)}_distribution.png"
     path = out_dir / filename
     fig.savefig(path)
     plt.close(fig)
@@ -702,6 +784,7 @@ def _save_rank_stability_plot(
     out_dir: Path,
     factor_name: str,
     level_to_ranks: dict[str, list[float]],
+    name_prefix: str = "",
 ) -> str | None:
     if not level_to_ranks:
         return None
@@ -734,11 +817,122 @@ def _save_rank_stability_plot(
         tick.set_ha("right")
     fig.tight_layout()
 
-    filename = f"{_safe_slug(factor_name)}_rank_stability.png"
+    slug_source = f"{name_prefix}:{factor_name}" if name_prefix else factor_name
+    filename = f"{_safe_slug(slug_source)}_rank_stability.png"
     path = out_dir / filename
     fig.savefig(path)
     plt.close(fig)
     return str(path)
+
+
+def _bucket_from_metrics(
+    sign_consistency: float,
+    practical_rate: float,
+    equivalence_rate: float,
+    has_sign_flip: bool,
+    has_sensitivity: bool,
+    thresholds: dict[str, Any],
+) -> str:
+    if has_sign_flip and sign_consistency < float(thresholds["sign_flip_redflag_pct"]):
+        return "REDFLAG"
+    if equivalence_rate >= float(thresholds["non_effect_pct"]):
+        return "NON_EFFECT"
+    if (
+        sign_consistency >= float(thresholds["stable_sign_pct"])
+        and practical_rate >= float(thresholds["stable_practical_pct"])
+        and not has_sensitivity
+    ):
+        return "STABLE"
+    return "CONDITIONAL"
+
+
+def _weighted_quantile(value_weight_pairs: list[tuple[float, float]], quantile: float) -> float:
+    if not value_weight_pairs:
+        return 0.0
+    cleaned = sorted((float(v), max(0.0, float(w))) for v, w in value_weight_pairs if float(w) > 0)
+    if not cleaned:
+        arr = sorted(float(v) for v, _ in value_weight_pairs)
+        idx = min(len(arr) - 1, max(0, int(round(quantile * (len(arr) - 1)))))
+        return float(arr[idx])
+    total = float(sum(w for _, w in cleaned))
+    target = max(0.0, min(1.0, float(quantile))) * total
+    running = 0.0
+    for value, weight in cleaned:
+        running += weight
+        if running >= target:
+            return float(value)
+    return float(cleaned[-1][0])
+
+
+def _weighted_distribution(value_weight_pairs: list[tuple[float, float]]) -> dict[str, float]:
+    if not value_weight_pairs:
+        return {"median": 0.0, "iqr": 0.0, "min": 0.0, "max": 0.0}
+    values = [float(v) for v, _ in value_weight_pairs]
+    median = _weighted_quantile(value_weight_pairs, 0.5)
+    q1 = _weighted_quantile(value_weight_pairs, 0.25)
+    q3 = _weighted_quantile(value_weight_pairs, 0.75)
+    return {
+        "median": float(median),
+        "iqr": float(q3 - q1),
+        "min": float(min(values)),
+        "max": float(max(values)),
+    }
+
+
+def _weighted_effect_metrics(
+    value_weight_pairs: list[tuple[float, float]],
+    pvalue_weight_pairs: list[tuple[float, float]],
+    thresholds: dict[str, Any],
+    has_sensitivity: bool,
+) -> dict[str, Any]:
+    if not value_weight_pairs:
+        return {
+            "bucket": "NON_EFFECT",
+            "sign_consistency": 1.0,
+            "practical_rate": 0.0,
+            "equivalence_rate": 1.0,
+            "p_sig_rate": None,
+            "estimate_distribution": {"median": 0.0, "iqr": 0.0, "min": 0.0, "max": 0.0},
+        }
+    weighted = [(float(v), max(0.0, float(w))) for v, w in value_weight_pairs]
+    total_w = float(sum(w for _, w in weighted))
+    if total_w <= 0:
+        weighted = [(v, 1.0) for v, _ in weighted]
+        total_w = float(len(weighted))
+
+    pos = float(sum(w for v, w in weighted if v > 0.0)) / total_w
+    neg = float(sum(w for v, w in weighted if v < 0.0)) / total_w
+    sign_consistency = max(pos, neg)
+    practical_rate = float(sum(w for v, w in weighted if abs(v) > float(thresholds["engineering_delta"]))) / total_w
+    equivalence_rate = float(sum(w for v, w in weighted if abs(v) < float(thresholds["equivalence_bound"]))) / total_w
+    has_sign_flip = pos > 0.0 and neg > 0.0
+    bucket = _bucket_from_metrics(
+        sign_consistency,
+        practical_rate,
+        equivalence_rate,
+        has_sign_flip=has_sign_flip,
+        has_sensitivity=has_sensitivity,
+        thresholds=thresholds,
+    )
+
+    p_sig_rate = None
+    if pvalue_weight_pairs:
+        p_pairs = [(float(p), max(0.0, float(w))) for p, w in pvalue_weight_pairs]
+        p_total = float(sum(w for _, w in p_pairs))
+        if p_total <= 0:
+            p_total = float(len(p_pairs))
+            p_sig_rate = float(sum(1.0 for p, _ in p_pairs if p < 0.05)) / p_total
+        else:
+            p_sig_rate = float(sum(w for p, w in p_pairs if p < 0.05)) / p_total
+    return {
+        "bucket": bucket,
+        "sign_consistency": sign_consistency,
+        "practical_rate": practical_rate,
+        "equivalence_rate": equivalence_rate,
+        "p_sig_rate": p_sig_rate,
+        "estimate_distribution": _weighted_distribution(weighted),
+    }
+
 
 
 def run_stability_analysis(
@@ -748,11 +942,12 @@ def run_stability_analysis(
     include_robust: bool,
     artifact_dir: str = "artifacts",
 ) -> dict[str, Any]:
-    runs = list_model_runs(db_path, analysis_id)
+    all_runs = list_model_runs(db_path, analysis_id)
     if include_robust:
-        selected = [r for r in runs if r["validity_class"] in {"valid", "valid_with_robust_se"}]
+        selected = [r for r in all_runs if r["validity_class"] in {"valid", "valid_with_robust_se"}]
     else:
-        selected = [r for r in runs if r["validity_class"] == "valid"]
+        selected = [r for r in all_runs if r["validity_class"] == "valid"]
+
     thresholds = {
         "engineering_delta": float(config.get("engineering_delta", 0.1)),
         "equivalence_bound": float(config.get("equivalence_bound", 0.05)),
@@ -765,88 +960,86 @@ def run_stability_analysis(
     categorical_covariates = _as_list(config.get("categorical_covariates"))
     primary_factors = _as_list(config.get("primary_factors"))
     interaction_candidates = _as_list(config.get("interaction_candidates"))
+    candidate_covs = list(dict.fromkeys(categorical_covariates + continuous_covariates))
     plot_dir = _stability_plot_dir(artifact_dir, analysis_id)
 
-    effects: list[dict[str, Any]] = []
-    pair_map: dict[str, dict[str, Any]] = {}
-    rank_map: dict[str, dict[str, Any]] = {}
-    slope_map: dict[str, dict[str, Any]] = {}
-    interaction_map: dict[str, dict[str, Any]] = {}
+    def build_effect_bundle(run_subset: list[dict[str, Any]], name_prefix: str) -> dict[str, Any]:
+        effects: list[dict[str, Any]] = []
+        effect_data: dict[str, dict[str, Any]] = {}
+        pair_map: dict[str, dict[str, Any]] = {}
+        rank_map: dict[str, dict[str, Any]] = {}
+        slope_map: dict[str, dict[str, Any]] = {}
+        interaction_map: dict[str, dict[str, Any]] = {}
 
-    for run in selected:
-        model_class = run["model_class"]
-        included_terms = run["included_terms"]
-        coeffs = run["coeffs"]
-        pvalues = run["pvalues"]
-        for cov in continuous_covariates:
-            coef_key = quote_name(cov)
-            if coef_key in coeffs:
-                key = f"SLOPE:{cov}"
-                slot = slope_map.setdefault(key, {"values": [], "pvalues": [], "class_values": {}, "class_pvalues": {}, "model_values": []})
-                val = float(coeffs[coef_key])
-                slot["values"].append(val)
-                slot["pvalues"].append(float(pvalues.get(coef_key, 1.0)))
-                slot["class_values"].setdefault(model_class, []).append(val)
-                slot["class_pvalues"].setdefault(model_class, []).append(float(pvalues.get(coef_key, 1.0)))
-                slot["model_values"].append((val, included_terms))
+        for run in run_subset:
+            model_class = str(run.get("model_class", "ANOVA"))
+            included_terms = run.get("included_terms", [])
+            coeffs = run.get("coeffs", {})
+            pvalues = run.get("pvalues", {})
 
-        lsmeans = run["lsmeans"]
-        for factor in primary_factors:
-            fac = lsmeans.get(factor, {})
-            for pair in fac.get("pairwise_differences", []):
-                a = pair["level_a"]
-                b = pair["level_b"]
-                key = f"PAIRWISE_DIFF:{factor}:{a}:{b}"
-                slot = pair_map.setdefault(key, {"factor": factor, "a": a, "b": b, "values": [], "class_values": {}, "model_values": []})
-                val = float(pair["difference"])
-                slot["values"].append(val)
-                slot["class_values"].setdefault(model_class, []).append(val)
-                slot["model_values"].append((val, included_terms))
-            means = fac.get("adjusted_means", [])
-            for rank, entry in enumerate(means, start=1):
-                level = entry["level"]
-                key = f"RANKING:{factor}:{level}"
-                slot = rank_map.setdefault(key, {"factor": factor, "level": level, "values": [], "class_values": {}})
-                slot["values"].append(float(rank))
-                slot["class_values"].setdefault(model_class, []).append(float(rank))
+            for cov in continuous_covariates:
+                coef_key = quote_name(cov)
+                if coef_key in coeffs:
+                    key = f"SLOPE:{cov}"
+                    slot = slope_map.setdefault(key, {"values": [], "pvalues": [], "class_values": {}, "class_pvalues": {}, "model_values": []})
+                    val = float(coeffs[coef_key])
+                    pval = float(pvalues.get(coef_key, 1.0))
+                    slot["values"].append(val)
+                    slot["pvalues"].append(pval)
+                    slot["class_values"].setdefault(model_class, []).append(val)
+                    slot["class_pvalues"].setdefault(model_class, []).append(pval)
+                    slot["model_values"].append((val, included_terms))
 
-        for inter in interaction_candidates:
-            left_right = [p.strip() for p in inter.split(":")]
-            if len(left_right) != 2:
-                continue
-            candidates = [k for k in coeffs if ":" in k and all(quote_name(x) in k or x in k for x in left_right)]
-            if not candidates:
-                continue
-            value = max((abs(float(coeffs[k])) for k in candidates), default=0.0)
-            key = f"INTERACTION_FLAG:{inter}"
-            slot = interaction_map.setdefault(key, {"interaction": inter, "values": [], "class_values": {}, "model_values": []})
-            slot["values"].append(value)
-            slot["class_values"].setdefault(model_class, []).append(value)
-            slot["model_values"].append((value, included_terms))
+            lsmeans = run.get("lsmeans", {})
+            for factor in primary_factors:
+                fac = lsmeans.get(factor, {})
+                for pair in fac.get("pairwise_differences", []):
+                    key = f"PAIRWISE_DIFF:{factor}:{pair['level_a']}:{pair['level_b']}"
+                    slot = pair_map.setdefault(key, {"factor": factor, "a": pair["level_a"], "b": pair["level_b"], "values": [], "class_values": {}, "model_values": []})
+                    val = float(pair["difference"])
+                    slot["values"].append(val)
+                    slot["class_values"].setdefault(model_class, []).append(val)
+                    slot["model_values"].append((val, included_terms))
+                for rank, entry in enumerate(fac.get("adjusted_means", []), start=1):
+                    key = f"RANKING:{factor}:{entry['level']}"
+                    slot = rank_map.setdefault(key, {"factor": factor, "level": entry["level"], "values": [], "class_values": {}})
+                    slot["values"].append(float(rank))
+                    slot["class_values"].setdefault(model_class, []).append(float(rank))
 
-    candidate_covs = list(dict.fromkeys(categorical_covariates + continuous_covariates))
-    rank_plot_paths: dict[str, str | None] = {}
-    rank_by_factor: dict[str, dict[str, list[float]]] = {}
-    for slot in rank_map.values():
-        rank_by_factor.setdefault(str(slot["factor"]), {})[str(slot["level"])] = list(slot["values"])
-    for factor, level_map in rank_by_factor.items():
-        rank_plot_paths[factor] = _save_rank_stability_plot(plot_dir, factor, level_map)
+            for inter in interaction_candidates:
+                left_right = [p.strip() for p in inter.split(":")]
+                if len(left_right) != 2:
+                    continue
+                candidates = [k for k in coeffs if ":" in k and all(quote_name(x) in k or x in k for x in left_right)]
+                if not candidates:
+                    continue
+                value = max((abs(float(coeffs[k])) for k in candidates), default=0.0)
+                key = f"INTERACTION_FLAG:{inter}"
+                slot = interaction_map.setdefault(key, {"interaction": inter, "values": [], "class_values": {}, "model_values": []})
+                slot["values"].append(value)
+                slot["class_values"].setdefault(model_class, []).append(value)
+                slot["model_values"].append((value, included_terms))
 
-    for key, slot in pair_map.items():
-        sens = _effect_sensitivity(slot["model_values"], candidate_covs, thresholds["engineering_delta"])
-        bucket, sign_consistency, practical_rate, equivalence_rate = _bucket_effect(
-            slot["values"],
-            thresholds["engineering_delta"],
-            thresholds["equivalence_bound"],
-            thresholds["stable_sign_pct"],
-            thresholds["stable_practical_pct"],
-            thresholds["non_effect_pct"],
-            thresholds["sign_flip_redflag_pct"],
-            has_sensitivity=bool(sens),
-        )
-        plot_path = _save_effect_distribution_plot(plot_dir, key, slot["values"], "Effect value (pairwise difference)")
-        effects.append(
-            {
+        rank_by_factor: dict[str, dict[str, list[float]]] = {}
+        for slot in rank_map.values():
+            rank_by_factor.setdefault(str(slot["factor"]), {})[str(slot["level"])] = list(slot["values"])
+        rank_plot_paths = {
+            factor: _save_rank_stability_plot(plot_dir, factor, level_map, name_prefix=name_prefix)
+            for factor, level_map in rank_by_factor.items()
+        }
+        for key, slot in pair_map.items():
+            sens = _effect_sensitivity(slot["model_values"], candidate_covs, thresholds["engineering_delta"])
+            bucket, sign_consistency, practical_rate, equivalence_rate = _bucket_effect(
+                slot["values"],
+                thresholds["engineering_delta"],
+                thresholds["equivalence_bound"],
+                thresholds["stable_sign_pct"],
+                thresholds["stable_practical_pct"],
+                thresholds["non_effect_pct"],
+                thresholds["sign_flip_redflag_pct"],
+                has_sensitivity=bool(sens),
+            )
+            effects.append({
                 "effect_id": key,
                 "effect_type": "PAIRWISE_DIFF",
                 "factor_name": slot["factor"],
@@ -859,33 +1052,36 @@ def run_stability_analysis(
                 "p_sig_rate": None,
                 "sensitivity_flags": sens,
                 "bucket": bucket,
-                "plot_path": plot_path,
-                "narrative": f'{slot["factor"]}: {slot["a"]} vs {slot["b"]} is {bucket.lower()} across valid models.',
-                "stratified_summaries": _stratified_metrics(
-                    slot["class_values"],
-                    {},
-                    thresholds,
-                ),
+                "plot_path": _save_effect_distribution_plot(plot_dir, key, slot["values"], "Effect value (pairwise difference)", name_prefix=name_prefix),
+                "narrative": f"{slot['factor']}: {slot['a']} vs {slot['b']} is {bucket.lower()} across valid models.",
+                "stratified_summaries": _stratified_metrics(slot["class_values"], {}, thresholds),
+            })
+            effect_data[key] = {
+                "effect_type": "PAIRWISE_DIFF",
+                "factor_name": slot["factor"],
+                "level_a": slot["a"],
+                "level_b": slot["b"],
+                "values": list(slot["values"]),
+                "pvalues": [],
+                "class_values": {k: list(v) for k, v in slot["class_values"].items()},
+                "class_pvalues": {},
+                "sensitivity_flags": sens,
             }
-        )
 
-    for key, slot in slope_map.items():
-        sens = _effect_sensitivity(slot["model_values"], candidate_covs, thresholds["engineering_delta"])
-        bucket, sign_consistency, practical_rate, equivalence_rate = _bucket_effect(
-            slot["values"],
-            thresholds["engineering_delta"],
-            thresholds["equivalence_bound"],
-            thresholds["stable_sign_pct"],
-            thresholds["stable_practical_pct"],
-            thresholds["non_effect_pct"],
-            thresholds["sign_flip_redflag_pct"],
-            has_sensitivity=bool(sens),
-        )
-        p_sig_rate = float(np.mean(np.array(slot["pvalues"]) < 0.05)) if slot["pvalues"] else None
-        cov_name = key.split(":")[1]
-        plot_path = _save_effect_distribution_plot(plot_dir, key, slot["values"], "Effect value (slope)")
-        effects.append(
-            {
+        for key, slot in slope_map.items():
+            sens = _effect_sensitivity(slot["model_values"], candidate_covs, thresholds["engineering_delta"])
+            bucket, sign_consistency, practical_rate, equivalence_rate = _bucket_effect(
+                slot["values"],
+                thresholds["engineering_delta"],
+                thresholds["equivalence_bound"],
+                thresholds["stable_sign_pct"],
+                thresholds["stable_practical_pct"],
+                thresholds["non_effect_pct"],
+                thresholds["sign_flip_redflag_pct"],
+                has_sensitivity=bool(sens),
+            )
+            cov_name = key.split(":", 1)[1]
+            effects.append({
                 "effect_id": key,
                 "effect_type": "SLOPE",
                 "factor_name": cov_name,
@@ -895,26 +1091,30 @@ def run_stability_analysis(
                 "sign_consistency": sign_consistency,
                 "practical_rate": practical_rate,
                 "equivalence_rate": equivalence_rate,
-                "p_sig_rate": p_sig_rate,
+                "p_sig_rate": float(np.mean(np.array(slot["pvalues"]) < 0.05)) if slot["pvalues"] else None,
                 "sensitivity_flags": sens,
                 "bucket": bucket,
-                "plot_path": plot_path,
+                "plot_path": _save_effect_distribution_plot(plot_dir, key, slot["values"], "Effect value (slope)", name_prefix=name_prefix),
                 "narrative": f"Slope for {cov_name} is {bucket.lower()} across model universe.",
-                "stratified_summaries": _stratified_metrics(
-                    slot["class_values"],
-                    slot["class_pvalues"],
-                    thresholds,
-                ),
+                "stratified_summaries": _stratified_metrics(slot["class_values"], slot["class_pvalues"], thresholds),
+            })
+            effect_data[key] = {
+                "effect_type": "SLOPE",
+                "factor_name": cov_name,
+                "level_a": None,
+                "level_b": None,
+                "values": list(slot["values"]),
+                "pvalues": list(slot["pvalues"]),
+                "class_values": {k: list(v) for k, v in slot["class_values"].items()},
+                "class_pvalues": {k: list(v) for k, v in slot["class_pvalues"].items()},
+                "sensitivity_flags": sens,
             }
-        )
 
-    for key, slot in rank_map.items():
-        values = slot["values"]
-        dist = _estimate_distribution(values)
-        iqr = dist["iqr"]
-        bucket = "STABLE" if iqr <= 1.0 else "CONDITIONAL"
-        effects.append(
-            {
+        for key, slot in rank_map.items():
+            dist = _estimate_distribution(slot["values"])
+            iqr = dist["iqr"]
+            bucket = "STABLE" if iqr <= 1.0 else "CONDITIONAL"
+            effects.append({
                 "effect_id": key,
                 "effect_type": "RANKING",
                 "factor_name": slot["factor"],
@@ -928,31 +1128,34 @@ def run_stability_analysis(
                 "sensitivity_flags": {},
                 "bucket": bucket,
                 "plot_path": rank_plot_paths.get(str(slot["factor"])),
-                "narrative": f'Level {slot["level"]} ranking for {slot["factor"]} has rank IQR {iqr:.2f}.',
-                "stratified_summaries": {
-                    cls: {
-                        "estimate_distribution": _estimate_distribution(vals),
-                        "n_models": len(vals),
-                    }
-                    for cls, vals in slot["class_values"].items()
-                },
+                "narrative": f"Level {slot['level']} ranking for {slot['factor']} has rank IQR {iqr:.2f}.",
+                "stratified_summaries": {cls: {"estimate_distribution": _estimate_distribution(vals), "n_models": len(vals)} for cls, vals in slot["class_values"].items()},
+            })
+            effect_data[key] = {
+                "effect_type": "RANKING",
+                "factor_name": slot["factor"],
+                "level_a": slot["level"],
+                "level_b": None,
+                "values": list(slot["values"]),
+                "pvalues": [],
+                "class_values": {k: list(v) for k, v in slot["class_values"].items()},
+                "class_pvalues": {},
+                "sensitivity_flags": {},
             }
-        )
 
-    for key, slot in interaction_map.items():
-        sens = _effect_sensitivity(slot["model_values"], candidate_covs, thresholds["engineering_delta"])
-        bucket, sign_consistency, practical_rate, equivalence_rate = _bucket_effect(
-            slot["values"],
-            thresholds["engineering_delta"],
-            thresholds["equivalence_bound"],
-            thresholds["stable_sign_pct"],
-            thresholds["stable_practical_pct"],
-            thresholds["non_effect_pct"],
-            thresholds["sign_flip_redflag_pct"],
-            has_sensitivity=bool(sens),
-        )
-        effects.append(
-            {
+        for key, slot in interaction_map.items():
+            sens = _effect_sensitivity(slot["model_values"], candidate_covs, thresholds["engineering_delta"])
+            bucket, sign_consistency, practical_rate, equivalence_rate = _bucket_effect(
+                slot["values"],
+                thresholds["engineering_delta"],
+                thresholds["equivalence_bound"],
+                thresholds["stable_sign_pct"],
+                thresholds["stable_practical_pct"],
+                thresholds["non_effect_pct"],
+                thresholds["sign_flip_redflag_pct"],
+                has_sensitivity=bool(sens),
+            )
+            effects.append({
                 "effect_id": key,
                 "effect_type": "INTERACTION_FLAG",
                 "factor_name": slot["interaction"],
@@ -966,29 +1169,217 @@ def run_stability_analysis(
                 "sensitivity_flags": sens,
                 "bucket": "CONDITIONAL" if bucket == "STABLE" else bucket,
                 "plot_path": None,
-                "narrative": f'Interaction {slot["interaction"]} signals conditional behavior.',
+                "narrative": f"Interaction {slot['interaction']} signals conditional behavior.",
                 "stratified_summaries": _stratified_metrics(slot["class_values"], {}, thresholds),
+            })
+            effect_data[key] = {
+                "effect_type": "INTERACTION_FLAG",
+                "factor_name": slot["interaction"],
+                "level_a": None,
+                "level_b": None,
+                "values": list(slot["values"]),
+                "pvalues": [],
+                "class_values": {k: list(v) for k, v in slot["class_values"].items()},
+                "class_pvalues": {},
+                "sensitivity_flags": sens,
             }
-        )
 
-    effects.sort(key=lambda x: (x["bucket"], x["effect_type"], x["effect_id"]))
+        effects.sort(key=lambda x: (x["bucket"], x["effect_type"], x["effect_id"]))
+        return {
+            "effects": effects,
+            "effect_data": effect_data,
+            "bucket_counts": {
+                "STABLE": sum(1 for e in effects if e["bucket"] == "STABLE"),
+                "CONDITIONAL": sum(1 for e in effects if e["bucket"] == "CONDITIONAL"),
+                "NON_EFFECT": sum(1 for e in effects if e["bucket"] == "NON_EFFECT"),
+                "REDFLAG": sum(1 for e in effects if e["bucket"] == "REDFLAG"),
+            },
+            "n_models_used": len(run_subset),
+        }
+    group_rows = load_analysis_groups(db_path, analysis_id, selected_only=True)
+    if group_rows:
+        group_order = [str(g["group_key"]) for g in group_rows]
+        group_meta = {str(g["group_key"]): g for g in group_rows}
+    else:
+        group_order = sorted({str(r.get("group_key") or "__ALL__") for r in all_runs})
+        group_meta = {key: {"group_key": key, "group_values": {}, "n_rows_raw": 0, "n_rows_after_outlier": 0} for key in group_order}
+
+    total_models_by_group: dict[str, int] = {}
+    valid_models_by_group: dict[str, int] = {}
+    for run in all_runs:
+        key = str(run.get("group_key") or "__ALL__")
+        total_models_by_group[key] = total_models_by_group.get(key, 0) + 1
+    for run in selected:
+        key = str(run.get("group_key") or "__ALL__")
+        valid_models_by_group[key] = valid_models_by_group.get(key, 0) + 1
+
+    row_counts = {key: int(group_meta.get(key, {}).get("n_rows_after_outlier", group_meta.get(key, {}).get("n_rows_raw", 0))) for key in group_order}
+    total_rows = float(sum(max(0, row_counts.get(k, 0)) for k in group_order))
+    raw_weights: dict[str, float] = {}
+    for key in group_order:
+        row_share = (float(max(0, row_counts.get(key, 0))) / total_rows) if total_rows > 0 else 0.0
+        group_total = int(total_models_by_group.get(key, 0))
+        group_valid = int(valid_models_by_group.get(key, 0))
+        quality_share = (float(group_valid) / float(group_total)) if group_total > 0 else 0.0
+        raw_weights[key] = float(np.sqrt(max(0.0, row_share * quality_share)))
+    raw_sum = float(sum(raw_weights.values()))
+    if raw_sum > 0:
+        normalized_weights = {k: (raw_weights[k] / raw_sum) for k in group_order}
+    else:
+        eligible = [k for k in group_order if valid_models_by_group.get(k, 0) > 0]
+        normalized_weights = {k: (1.0 / len(eligible) if k in eligible and eligible else 0.0) for k in group_order}
+
+    per_group: list[dict[str, Any]] = []
+    group_factor_panels: list[dict[str, Any]] = []
+    per_group_effect_data: dict[str, dict[str, dict[str, Any]]] = {}
+    for group_key in group_order:
+        runs_for_group = [r for r in selected if str(r.get("group_key") or "__ALL__") == group_key]
+        bundle = build_effect_bundle(runs_for_group, name_prefix=f"group:{group_key}")
+        per_group_effect_data[group_key] = bundle["effect_data"]
+        info = group_meta.get(group_key, {})
+        per_group.append({
+            "group_key": group_key,
+            "group_values": info.get("group_values", {}),
+            "n_rows_raw": int(info.get("n_rows_raw", 0)),
+            "n_rows_after_outlier": int(info.get("n_rows_after_outlier", info.get("n_rows_raw", 0))),
+            "n_models_total": int(total_models_by_group.get(group_key, 0)),
+            "n_models_used": int(bundle["n_models_used"]),
+            "weight_raw": float(raw_weights.get(group_key, 0.0)),
+            "weight_normalized": float(normalized_weights.get(group_key, 0.0)),
+            "bucket_counts": bundle["bucket_counts"],
+            "effects": bundle["effects"],
+        })
+
+        if primary_factors:
+            for factor in primary_factors:
+                factor_effects = [
+                    e for e in bundle["effects"] if str(e.get("factor_name", "")) == factor and e.get("effect_type") in {"PAIRWISE_DIFF", "RANKING"}
+                ]
+                group_factor_panels.append({
+                    "panel_id": _safe_slug(f"{group_key}:{factor}"),
+                    "group_key": group_key,
+                    "group_values": info.get("group_values", {}),
+                    "factor_name": factor,
+                    "effect_count": len(factor_effects),
+                    "bucket_counts": {
+                        "STABLE": sum(1 for e in factor_effects if e["bucket"] == "STABLE"),
+                        "CONDITIONAL": sum(1 for e in factor_effects if e["bucket"] == "CONDITIONAL"),
+                        "NON_EFFECT": sum(1 for e in factor_effects if e["bucket"] == "NON_EFFECT"),
+                        "REDFLAG": sum(1 for e in factor_effects if e["bucket"] == "REDFLAG"),
+                    },
+                    "effects": factor_effects,
+                    "n_models_used": int(bundle["n_models_used"]),
+                    "n_rows_after_outlier": int(info.get("n_rows_after_outlier", info.get("n_rows_raw", 0))),
+                })
+
+    combined_effects: list[dict[str, Any]] = []
+    by_effect: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for group_key, effect_map in per_group_effect_data.items():
+        if normalized_weights.get(group_key, 0.0) <= 0:
+            continue
+        for effect_id, payload in effect_map.items():
+            by_effect.setdefault(effect_id, []).append((group_key, payload))
+
+    for effect_id, entries in by_effect.items():
+        first = entries[0][1]
+        sensitivity_flags: dict[str, bool] = {}
+        value_pairs: list[tuple[float, float]] = []
+        pvalue_pairs: list[tuple[float, float]] = []
+        class_values: dict[str, list[tuple[float, float]]] = {}
+        class_pvalues: dict[str, list[tuple[float, float]]] = {}
+        for group_key, payload in entries:
+            g_weight = float(normalized_weights.get(group_key, 0.0))
+            if g_weight <= 0:
+                continue
+            vals = [float(v) for v in payload.get("values", [])]
+            if vals:
+                per_w = g_weight / float(len(vals))
+                value_pairs.extend((v, per_w) for v in vals)
+            pvals = [float(v) for v in payload.get("pvalues", [])]
+            if pvals:
+                per_pw = g_weight / float(len(pvals))
+                pvalue_pairs.extend((p, per_pw) for p in pvals)
+            for cls, cls_vals in payload.get("class_values", {}).items():
+                cls_vals_f = [float(v) for v in cls_vals]
+                if cls_vals_f:
+                    cls_w = g_weight / float(len(cls_vals_f))
+                    class_values.setdefault(cls, []).extend((v, cls_w) for v in cls_vals_f)
+            for cls, cls_p in payload.get("class_pvalues", {}).items():
+                cls_p_f = [float(v) for v in cls_p]
+                if cls_p_f:
+                    cls_pw = g_weight / float(len(cls_p_f))
+                    class_pvalues.setdefault(cls, []).extend((p, cls_pw) for p in cls_p_f)
+            for k, v in payload.get("sensitivity_flags", {}).items():
+                if v:
+                    sensitivity_flags[k] = True
+
+        weighted = _weighted_effect_metrics(value_pairs, pvalue_pairs, thresholds, has_sensitivity=bool(sensitivity_flags))
+        stratified_summaries = {}
+        for cls, cls_pairs in class_values.items():
+            cls_metrics = _weighted_effect_metrics(cls_pairs, class_pvalues.get(cls, []), thresholds, has_sensitivity=False)
+            stratified_summaries[cls] = {
+                "estimate_distribution": cls_metrics["estimate_distribution"],
+                "sign_consistency": cls_metrics["sign_consistency"],
+                "practical_rate": cls_metrics["practical_rate"],
+                "equivalence_rate": cls_metrics["equivalence_rate"],
+                "p_sig_rate": cls_metrics["p_sig_rate"],
+                "n_models": len(cls_pairs),
+            }
+
+        x_label = "Effect value"
+        if first["effect_type"] == "PAIRWISE_DIFF":
+            x_label = "Effect value (pairwise difference)"
+        elif first["effect_type"] == "SLOPE":
+            x_label = "Effect value (slope)"
+        elif first["effect_type"] == "RANKING":
+            x_label = "Rank value"
+
+        combined_effects.append({
+            "effect_id": effect_id,
+            "effect_type": first["effect_type"],
+            "factor_name": first.get("factor_name"),
+            "level_a": first.get("level_a"),
+            "level_b": first.get("level_b"),
+            "estimate_distribution": weighted["estimate_distribution"],
+            "sign_consistency": weighted["sign_consistency"],
+            "practical_rate": weighted["practical_rate"],
+            "equivalence_rate": weighted["equivalence_rate"],
+            "p_sig_rate": weighted["p_sig_rate"],
+            "sensitivity_flags": sensitivity_flags,
+            "bucket": weighted["bucket"],
+            "plot_path": _save_effect_distribution_plot(plot_dir, effect_id, [float(v) for v, _ in value_pairs], x_label, name_prefix="combined"),
+            "narrative": "Combined across groups with normalized row/quality weighting.",
+            "stratified_summaries": stratified_summaries,
+        })
+
+    combined_effects.sort(key=lambda x: (x["bucket"], x["effect_type"], x["effect_id"]))
     summary = {
         "n_models_used": len(selected),
         "include_robust": include_robust,
+        "selected_group_count": len(group_order),
         "bucket_counts": {
-            "STABLE": sum(1 for e in effects if e["bucket"] == "STABLE"),
-            "CONDITIONAL": sum(1 for e in effects if e["bucket"] == "CONDITIONAL"),
-            "NON_EFFECT": sum(1 for e in effects if e["bucket"] == "NON_EFFECT"),
-            "REDFLAG": sum(1 for e in effects if e["bucket"] == "REDFLAG"),
+            "STABLE": sum(1 for e in combined_effects if e["bucket"] == "STABLE"),
+            "CONDITIONAL": sum(1 for e in combined_effects if e["bucket"] == "CONDITIONAL"),
+            "NON_EFFECT": sum(1 for e in combined_effects if e["bucket"] == "NON_EFFECT"),
+            "REDFLAG": sum(1 for e in combined_effects if e["bucket"] == "REDFLAG"),
         },
+        "group_weights": [
+            {
+                "group_key": g,
+                "weight_raw": float(raw_weights.get(g, 0.0)),
+                "weight_normalized": float(normalized_weights.get(g, 0.0)),
+                "n_rows_after_outlier": int(row_counts.get(g, 0)),
+                "n_models_total": int(total_models_by_group.get(g, 0)),
+                "n_models_valid": int(valid_models_by_group.get(g, 0)),
+            }
+            for g in group_order
+        ],
     }
     stratified = {
-        "ANOVA": {
-            "n_models": sum(1 for r in selected if r["model_class"] == "ANOVA"),
-        },
-        "ANCOVA": {
-            "n_models": sum(1 for r in selected if r["model_class"] == "ANCOVA"),
-        },
+        "ANOVA": {"n_models": sum(1 for r in selected if r.get("model_class") == "ANOVA")},
+        "ANCOVA": {"n_models": sum(1 for r in selected if r.get("model_class") == "ANCOVA")},
+        "per_group": per_group,
+        "group_factor_panels": group_factor_panels,
     }
 
     with get_conn(db_path) as conn:
@@ -1004,14 +1395,14 @@ def run_stability_analysis(
                 1 if include_robust else 0,
                 to_json(thresholds),
                 to_json(summary),
-                to_json(effects),
+                to_json(combined_effects),
                 to_json(stratified),
             ],
         )
         conn.execute("UPDATE analyses SET status = 'stability_complete', updated_at = ? WHERE id = ?", [utcnow_iso(), analysis_id])
         conn.commit()
-    return {"summary": summary, "effects": effects, "stratified": stratified, "thresholds": thresholds}
 
+    return {"summary": summary, "effects": combined_effects, "stratified": stratified, "thresholds": thresholds}
 
 def latest_stability(db_path: str, analysis_id: int) -> dict[str, Any] | None:
     row = fetchone(
@@ -1032,3 +1423,4 @@ def latest_stability(db_path: str, analysis_id: int) -> dict[str, Any] | None:
     rec["effects"] = from_json(rec["effects_json"], [])
     rec["stratified"] = from_json(rec["stratified_json"], {})
     return rec
+

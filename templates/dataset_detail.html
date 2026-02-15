@@ -45,12 +45,12 @@
 
 <div class="panel">
   <h2>Profiling Summary</h2>
-  <table class="profile-summary-table">
+  <table class="profile-summary-table" data-sortable="true">
     <tr>
-      <th>Categorical</th>
-      <th>Continuous</th>
-      <th>Excluded</th>
-      <th>Columns With Missing Data</th>
+      <th data-sort-type="numeric">Categorical</th>
+      <th data-sort-type="numeric">Continuous</th>
+      <th data-sort-type="numeric">Excluded</th>
+      <th data-sort-type="numeric">Columns With Missing Data</th>
     </tr>
     <tr>
       <td>{{ profile_summary.categorical_count }}</td>
@@ -65,16 +65,16 @@
   <h2>Variable Classification</h2>
   <form method="post" action="{{ url_for('sme.update_dataset_roles', dataset_id=dataset.id) }}">
     <div class="table-wrap">
-      <table class="variable-table">
+      <table class="variable-table" data-sortable="true">
         <tr>
-          <th>Column</th>
-          <th>Detected Type</th>
-          <th class="model-role-col">Model Role (editable)</th>
-          <th>Unique</th>
-          <th>Missing</th>
-          <th class="ratio-head" title="Share of non-null values that can be parsed as numeric.">Numeric Ratio</th>
-          <th class="ratio-head" title="Share of non-null values that can be parsed as datetime.">Datetime Ratio</th>
-          <th>Exclude Reason</th>
+          <th data-sort-type="text">Column</th>
+          <th data-sort-type="text">Detected Type</th>
+          <th class="model-role-col" data-sort-type="text">Model Role (editable)</th>
+          <th data-sort-type="numeric">Unique</th>
+          <th data-sort-type="numeric">Missing</th>
+          <th class="ratio-head" data-sort-type="numeric" title="Share of non-null values that can be parsed as numeric.">Numeric Ratio</th>
+          <th class="ratio-head" data-sort-type="numeric" title="Share of non-null values that can be parsed as datetime.">Datetime Ratio</th>
+          <th data-sort-type="text">Exclude Reason</th>
         </tr>
         {% for c in columns %}
           <tr class="role-{{ c.model_role }}">
