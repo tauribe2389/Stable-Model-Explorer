@@ -661,10 +661,42 @@ def list_model_runs(db_path: str, analysis_id: int) -> list[dict[str, Any]]:
     return out
 
 
+def _coerce_finite_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(parsed):
+        return None
+    return float(parsed)
+
+
+def _coerce_finite_list(values: Any) -> list[float]:
+    if values is None:
+        return []
+    if isinstance(values, (str, bytes)):
+        return []
+    if isinstance(values, dict):
+        iterator = values.values()
+    else:
+        try:
+            iterator = iter(values)
+        except TypeError:
+            single = _coerce_finite_float(values)
+            return [single] if single is not None else []
+    out: list[float] = []
+    for value in iterator:
+        parsed = _coerce_finite_float(value)
+        if parsed is not None:
+            out.append(parsed)
+    return out
+
+
 def _estimate_distribution(values: list[float]) -> dict[str, float]:
-    if not values:
+    cleaned = _coerce_finite_list(values)
+    if not cleaned:
         return {"median": 0.0, "iqr": 0.0, "min": 0.0, "max": 0.0}
-    arr = np.array(values, dtype=float)
+    arr = np.array(cleaned, dtype=float)
     q1, q3 = np.percentile(arr, [25, 75])
     return {
         "median": float(np.median(arr)),
@@ -677,23 +709,24 @@ def _estimate_distribution(values: list[float]) -> dict[str, float]:
 def _stratified_metrics(values_by_class: dict[str, list[float]], pvals_by_class: dict[str, list[float]], thresholds: dict[str, Any]) -> dict[str, Any]:
     out = {}
     for cls, vals in values_by_class.items():
-        if not vals:
+        cleaned_vals = _coerce_finite_list(vals)
+        if not cleaned_vals:
             continue
-        arr = np.array(vals, dtype=float)
+        arr = np.array(cleaned_vals, dtype=float)
         pos = float(np.mean(arr > 0))
         neg = float(np.mean(arr < 0))
         sign_consistency = max(pos, neg)
         practical_rate = float(np.mean(np.abs(arr) > thresholds["engineering_delta"]))
         equivalence_rate = float(np.mean(np.abs(arr) < thresholds["equivalence_bound"]))
-        sig_vals = pvals_by_class.get(cls, [])
+        sig_vals = _coerce_finite_list(pvals_by_class.get(cls, []))
         p_sig_rate = float(np.mean(np.array(sig_vals) < 0.05)) if sig_vals else None
         out[cls] = {
-            "estimate_distribution": _estimate_distribution(vals),
+            "estimate_distribution": _estimate_distribution(cleaned_vals),
             "sign_consistency": sign_consistency,
             "practical_rate": practical_rate,
             "equivalence_rate": equivalence_rate,
             "p_sig_rate": p_sig_rate,
-            "n_models": len(vals),
+            "n_models": len(cleaned_vals),
         }
     return out
 
@@ -703,8 +736,16 @@ def _effect_sensitivity(effect_model_values: list[tuple[float, list[str]]], cand
     if len(effect_model_values) < 6:
         return flags
     for cov in candidate_covariates:
-        in_vals = [v for v, terms in effect_model_values if cov in terms]
-        out_vals = [v for v, terms in effect_model_values if cov not in terms]
+        in_vals: list[float] = []
+        out_vals: list[float] = []
+        for value, terms in effect_model_values:
+            parsed = _coerce_finite_float(value)
+            if parsed is None:
+                continue
+            if cov in terms:
+                in_vals.append(parsed)
+            else:
+                out_vals.append(parsed)
         if len(in_vals) < 2 or len(out_vals) < 2:
             continue
         med_in = float(np.median(in_vals))
@@ -725,9 +766,10 @@ def _bucket_effect(
     redflag_sign_pct: float,
     has_sensitivity: bool,
 ) -> tuple[str, float, float, float]:
-    if not values:
+    cleaned = _coerce_finite_list(values)
+    if not cleaned:
         return BUCKET_NON_EFFECT, 1.0, 0.0, 1.0
-    arr = np.array(values, dtype=float)
+    arr = np.array(cleaned, dtype=float)
     pos_rate = float(np.mean(arr > 0))
     neg_rate = float(np.mean(arr < 0))
     sign_consistency = max(pos_rate, neg_rate)
@@ -771,9 +813,10 @@ def _save_effect_distribution_plot(
     x_label: str,
     name_prefix: str = "",
 ) -> str | None:
-    if not values:
+    cleaned = _coerce_finite_list(values)
+    if not cleaned:
         return None
-    arr = np.array(values, dtype=float)
+    arr = np.array(cleaned, dtype=float)
     bins = min(36, max(8, int(np.sqrt(len(arr)) * 2)))
     median = float(np.median(arr))
     q1, q3 = np.percentile(arr, [25, 75])
@@ -809,11 +852,13 @@ def _save_rank_stability_plot(
 ) -> str | None:
     if not level_to_ranks:
         return None
-    ordered = sorted(level_to_ranks.items(), key=lambda kv: float(np.median(kv[1])) if kv[1] else 9999.0)
-    labels = [str(k) for k, _ in ordered]
-    data = [list(map(float, vals)) for _, vals in ordered]
-    if not any(data):
+    cleaned_levels = {str(level): _coerce_finite_list(vals) for level, vals in level_to_ranks.items()}
+    cleaned_levels = {level: vals for level, vals in cleaned_levels.items() if vals}
+    if not cleaned_levels:
         return None
+    ordered = sorted(cleaned_levels.items(), key=lambda kv: float(np.median(kv[1])))
+    labels = [str(k) for k, _ in ordered]
+    data = [list(vals) for _, vals in ordered]
 
     fig, ax = plt.subplots(figsize=(max(6.2, 1.2 * len(labels)), 4.0))
     ax.boxplot(data, labels=labels, patch_artist=True, showfliers=True)
@@ -870,9 +915,18 @@ def _bucket_from_metrics(
 def _weighted_quantile(value_weight_pairs: list[tuple[float, float]], quantile: float) -> float:
     if not value_weight_pairs:
         return 0.0
-    cleaned = sorted((float(v), max(0.0, float(w))) for v, w in value_weight_pairs if float(w) > 0)
+    cleaned = []
+    for value, weight in value_weight_pairs:
+        v = _coerce_finite_float(value)
+        w = _coerce_finite_float(weight)
+        if v is None or w is None or w <= 0:
+            continue
+        cleaned.append((v, max(0.0, w)))
+    cleaned = sorted(cleaned)
     if not cleaned:
-        arr = sorted(float(v) for v, _ in value_weight_pairs)
+        arr = sorted(v for v in (_coerce_finite_float(value) for value, _ in value_weight_pairs) if v is not None)
+        if not arr:
+            return 0.0
         idx = min(len(arr) - 1, max(0, int(round(quantile * (len(arr) - 1)))))
         return float(arr[idx])
     total = float(sum(w for _, w in cleaned))
@@ -888,10 +942,19 @@ def _weighted_quantile(value_weight_pairs: list[tuple[float, float]], quantile: 
 def _weighted_distribution(value_weight_pairs: list[tuple[float, float]]) -> dict[str, float]:
     if not value_weight_pairs:
         return {"median": 0.0, "iqr": 0.0, "min": 0.0, "max": 0.0}
-    values = [float(v) for v, _ in value_weight_pairs]
-    median = _weighted_quantile(value_weight_pairs, 0.5)
-    q1 = _weighted_quantile(value_weight_pairs, 0.25)
-    q3 = _weighted_quantile(value_weight_pairs, 0.75)
+    cleaned = []
+    for value, weight in value_weight_pairs:
+        v = _coerce_finite_float(value)
+        w = _coerce_finite_float(weight)
+        if v is None or w is None:
+            continue
+        cleaned.append((v, w))
+    if not cleaned:
+        return {"median": 0.0, "iqr": 0.0, "min": 0.0, "max": 0.0}
+    values = [v for v, _ in cleaned]
+    median = _weighted_quantile(cleaned, 0.5)
+    q1 = _weighted_quantile(cleaned, 0.25)
+    q3 = _weighted_quantile(cleaned, 0.75)
     return {
         "median": float(median),
         "iqr": float(q3 - q1),
@@ -906,16 +969,27 @@ def _weighted_effect_metrics(
     thresholds: dict[str, Any],
     has_sensitivity: bool,
 ) -> dict[str, Any]:
+    default_payload = {
+        "bucket": BUCKET_NON_EFFECT,
+        "sign_consistency": 1.0,
+        "practical_rate": 0.0,
+        "equivalence_rate": 1.0,
+        "p_sig_rate": None,
+        "estimate_distribution": {"median": 0.0, "iqr": 0.0, "min": 0.0, "max": 0.0},
+    }
     if not value_weight_pairs:
-        return {
-            "bucket": BUCKET_NON_EFFECT,
-            "sign_consistency": 1.0,
-            "practical_rate": 0.0,
-            "equivalence_rate": 1.0,
-            "p_sig_rate": None,
-            "estimate_distribution": {"median": 0.0, "iqr": 0.0, "min": 0.0, "max": 0.0},
-        }
-    weighted = [(float(v), max(0.0, float(w))) for v, w in value_weight_pairs]
+        return default_payload
+
+    weighted: list[tuple[float, float]] = []
+    for value, weight in value_weight_pairs:
+        v = _coerce_finite_float(value)
+        w = _coerce_finite_float(weight)
+        if v is None or w is None:
+            continue
+        weighted.append((v, max(0.0, w)))
+    if not weighted:
+        return default_payload
+
     total_w = float(sum(w for _, w in weighted))
     if total_w <= 0:
         weighted = [(v, 1.0) for v, _ in weighted]
@@ -938,13 +1012,20 @@ def _weighted_effect_metrics(
 
     p_sig_rate = None
     if pvalue_weight_pairs:
-        p_pairs = [(float(p), max(0.0, float(w))) for p, w in pvalue_weight_pairs]
-        p_total = float(sum(w for _, w in p_pairs))
-        if p_total <= 0:
-            p_total = float(len(p_pairs))
-            p_sig_rate = float(sum(1.0 for p, _ in p_pairs if p < 0.05)) / p_total
-        else:
-            p_sig_rate = float(sum(w for p, w in p_pairs if p < 0.05)) / p_total
+        p_pairs: list[tuple[float, float]] = []
+        for pvalue, weight in pvalue_weight_pairs:
+            p = _coerce_finite_float(pvalue)
+            w = _coerce_finite_float(weight)
+            if p is None or w is None:
+                continue
+            p_pairs.append((p, max(0.0, w)))
+        if p_pairs:
+            p_total = float(sum(w for _, w in p_pairs))
+            if p_total <= 0:
+                p_total = float(len(p_pairs))
+                p_sig_rate = float(sum(1.0 for p, _ in p_pairs if p < 0.05)) / p_total
+            else:
+                p_sig_rate = float(sum(w for p, w in p_pairs if p < 0.05)) / p_total
     return {
         "bucket": bucket,
         "sign_consistency": sign_consistency,
@@ -953,7 +1034,6 @@ def _weighted_effect_metrics(
         "p_sig_rate": p_sig_rate,
         "estimate_distribution": _weighted_distribution(weighted),
     }
-
 
 
 def run_stability_analysis(
@@ -995,17 +1075,25 @@ def run_stability_analysis(
 
         for run in run_subset:
             model_class = str(run.get("model_class", MODEL_CLASS_ANOVA))
-            included_terms = run.get("included_terms", [])
+            raw_terms = run.get("included_terms", [])
+            if isinstance(raw_terms, (list, tuple, set)):
+                included_terms = [str(t) for t in raw_terms]
+            else:
+                included_terms = []
             coeffs = run.get("coeffs", {})
             pvalues = run.get("pvalues", {})
 
             for cov in continuous_covariates:
                 coef_key = quote_name(cov)
                 if coef_key in coeffs:
+                    val = _coerce_finite_float(coeffs.get(coef_key))
+                    if val is None:
+                        continue
+                    pval = _coerce_finite_float(pvalues.get(coef_key, 1.0))
+                    if pval is None:
+                        pval = 1.0
                     key = f"SLOPE:{cov}"
                     slot = slope_map.setdefault(key, {"values": [], "pvalues": [], "class_values": {}, "class_pvalues": {}, "model_values": []})
-                    val = float(coeffs[coef_key])
-                    pval = float(pvalues.get(coef_key, 1.0))
                     slot["values"].append(val)
                     slot["pvalues"].append(pval)
                     slot["class_values"].setdefault(model_class, []).append(val)
@@ -1013,20 +1101,36 @@ def run_stability_analysis(
                     slot["model_values"].append((val, included_terms))
 
             lsmeans = run.get("lsmeans", {})
+            if not isinstance(lsmeans, dict):
+                lsmeans = {}
             for factor in primary_factors:
                 fac = lsmeans.get(factor, {})
+                if not isinstance(fac, dict):
+                    continue
                 for pair in fac.get("pairwise_differences", []):
-                    key = f"PAIRWISE_DIFF:{factor}:{pair['level_a']}:{pair['level_b']}"
-                    slot = pair_map.setdefault(key, {"factor": factor, "a": pair["level_a"], "b": pair["level_b"], "values": [], "class_values": {}, "model_values": []})
-                    val = float(pair["difference"])
+                    if not isinstance(pair, dict):
+                        continue
+                    level_a = str(pair.get("level_a", "")).strip()
+                    level_b = str(pair.get("level_b", "")).strip()
+                    val = _coerce_finite_float(pair.get("difference"))
+                    if not level_a or not level_b or val is None:
+                        continue
+                    key = f"PAIRWISE_DIFF:{factor}:{level_a}:{level_b}"
+                    slot = pair_map.setdefault(key, {"factor": factor, "a": level_a, "b": level_b, "values": [], "class_values": {}, "model_values": []})
                     slot["values"].append(val)
                     slot["class_values"].setdefault(model_class, []).append(val)
                     slot["model_values"].append((val, included_terms))
                 for rank, entry in enumerate(fac.get("adjusted_means", []), start=1):
-                    key = f"RANKING:{factor}:{entry['level']}"
-                    slot = rank_map.setdefault(key, {"factor": factor, "level": entry["level"], "values": [], "class_values": {}})
-                    slot["values"].append(float(rank))
-                    slot["class_values"].setdefault(model_class, []).append(float(rank))
+                    if not isinstance(entry, dict):
+                        continue
+                    level = str(entry.get("level", "")).strip()
+                    if not level:
+                        continue
+                    rank_value = float(rank)
+                    key = f"RANKING:{factor}:{level}"
+                    slot = rank_map.setdefault(key, {"factor": factor, "level": level, "values": [], "class_values": {}})
+                    slot["values"].append(rank_value)
+                    slot["class_values"].setdefault(model_class, []).append(rank_value)
 
             for inter in interaction_candidates:
                 left_right = [p.strip() for p in inter.split(":")]
@@ -1035,7 +1139,10 @@ def run_stability_analysis(
                 candidates = [k for k in coeffs if ":" in k and all(quote_name(x) in k or x in k for x in left_right)]
                 if not candidates:
                     continue
-                value = max((abs(float(coeffs[k])) for k in candidates), default=0.0)
+                candidate_values = [abs(v) for v in (_coerce_finite_float(coeffs.get(k)) for k in candidates) if v is not None]
+                if not candidate_values:
+                    continue
+                value = max(candidate_values)
                 key = f"INTERACTION_FLAG:{inter}"
                 slot = interaction_map.setdefault(key, {"interaction": inter, "values": [], "class_values": {}, "model_values": []})
                 slot["values"].append(value)
@@ -1313,21 +1420,21 @@ def run_stability_analysis(
             g_weight = float(normalized_weights.get(group_key, 0.0))
             if g_weight <= 0:
                 continue
-            vals = [float(v) for v in payload.get("values", [])]
+            vals = _coerce_finite_list(payload.get("values", []))
             if vals:
                 per_w = g_weight / float(len(vals))
                 value_pairs.extend((v, per_w) for v in vals)
-            pvals = [float(v) for v in payload.get("pvalues", [])]
+            pvals = _coerce_finite_list(payload.get("pvalues", []))
             if pvals:
                 per_pw = g_weight / float(len(pvals))
                 pvalue_pairs.extend((p, per_pw) for p in pvals)
             for cls, cls_vals in payload.get("class_values", {}).items():
-                cls_vals_f = [float(v) for v in cls_vals]
+                cls_vals_f = _coerce_finite_list(cls_vals)
                 if cls_vals_f:
                     cls_w = g_weight / float(len(cls_vals_f))
                     class_values.setdefault(cls, []).extend((v, cls_w) for v in cls_vals_f)
             for cls, cls_p in payload.get("class_pvalues", {}).items():
-                cls_p_f = [float(v) for v in cls_p]
+                cls_p_f = _coerce_finite_list(cls_p)
                 if cls_p_f:
                     cls_pw = g_weight / float(len(cls_p_f))
                     class_pvalues.setdefault(cls, []).extend((p, cls_pw) for p in cls_p_f)
@@ -1369,7 +1476,7 @@ def run_stability_analysis(
             "p_sig_rate": weighted["p_sig_rate"],
             "sensitivity_flags": sensitivity_flags,
             "bucket": weighted["bucket"],
-            "plot_path": _save_effect_distribution_plot(plot_dir, effect_id, [float(v) for v, _ in value_pairs], x_label, name_prefix="combined"),
+            "plot_path": _save_effect_distribution_plot(plot_dir, effect_id, [v for v, _ in value_pairs], x_label, name_prefix="combined"),
             "narrative": "Combined across groups with normalized row/quality weighting.",
             "stratified_summaries": stratified_summaries,
         })
