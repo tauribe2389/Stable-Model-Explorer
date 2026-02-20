@@ -25,7 +25,7 @@ def get_conn(db_path: str):
         conn.close()
 
 
-def ensure_db(db_path: str) -> None:
+def ensure_schema(db_path: str) -> None:
     with get_conn(db_path) as conn:
         conn.executescript(
             """
@@ -212,18 +212,24 @@ def ensure_db(db_path: str) -> None:
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_model_registry_group ON model_registry(analysis_id, group_key)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_model_runs_group ON model_runs(analysis_id, group_key)")
+        conn.commit()
 
+
+def run_startup_maintenance(db_path: str) -> dict[str, Any]:
+    """Apply idempotent startup data maintenance separate from schema migration."""
+    with get_conn(db_path) as conn:
         now = utcnow_iso()
         conn.execute(
             "UPDATE datasets SET updated_at = COALESCE(updated_at, uploaded_at, ?) WHERE updated_at IS NULL OR updated_at = ''",
             [now],
         )
+        dataset_updated = int(conn.execute("SELECT changes()").fetchone()[0])
         conn.execute(
             "UPDATE analyses SET updated_at = COALESCE(updated_at, created_at, ?) WHERE updated_at IS NULL OR updated_at = ''",
             [now],
         )
+        analyses_updated = int(conn.execute("SELECT changes()").fetchone()[0])
 
-        # Clean any duplicate model_run rows created by overlapping run requests.
         conn.execute(
             """
             DELETE FROM model_runs
@@ -234,9 +240,8 @@ def ensure_db(db_path: str) -> None:
             )
             """
         )
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_model_runs_analysis_registry ON model_runs(analysis_id, registry_id)"
-        )
+        duplicate_model_runs_deleted = int(conn.execute("SELECT changes()").fetchone()[0])
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_model_runs_analysis_registry ON model_runs(analysis_id, registry_id)")
 
         dataset_dups = conn.execute(
             "SELECT LOWER(name) AS lname, COUNT(*) AS n FROM datasets GROUP BY LOWER(name) HAVING COUNT(*) > 1 LIMIT 1"
@@ -244,11 +249,28 @@ def ensure_db(db_path: str) -> None:
         analyses_dups = conn.execute(
             "SELECT LOWER(name) AS lname, COUNT(*) AS n FROM analyses GROUP BY LOWER(name) HAVING COUNT(*) > 1 LIMIT 1"
         ).fetchone()
+        dataset_name_index_applied = False
+        analysis_name_index_applied = False
         if not dataset_dups:
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_datasets_name_nocase ON datasets(name COLLATE NOCASE)")
+            dataset_name_index_applied = True
         if not analyses_dups:
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_analyses_name_nocase ON analyses(name COLLATE NOCASE)")
+            analysis_name_index_applied = True
         conn.commit()
+
+    return {
+        "datasets_updated_at_backfilled": dataset_updated,
+        "analyses_updated_at_backfilled": analyses_updated,
+        "duplicate_model_runs_deleted": duplicate_model_runs_deleted,
+        "dataset_name_nocase_index_applied": dataset_name_index_applied,
+        "analysis_name_nocase_index_applied": analysis_name_index_applied,
+    }
+
+
+def ensure_db(db_path: str) -> None:
+    """Backward-compatible wrapper for schema creation only."""
+    ensure_schema(db_path)
 
 
 def execute(db_path: str, sql: str, params: Iterable[Any] | None = None) -> None:

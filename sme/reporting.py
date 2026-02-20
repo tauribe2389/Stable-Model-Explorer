@@ -3,6 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .constants import (
+    BUCKET_CONDITIONAL,
+    BUCKET_NON_EFFECT,
+    BUCKET_REDFLAG,
+    BUCKET_STABLE,
+    VALIDITY_INVALID,
+    VALIDITY_VALID,
+    VALIDITY_VALID_WITH_ROBUST_SE,
+)
 from .db import fetchall, fetchone, from_json, get_conn, to_json, utcnow_iso
 from .modeling import latest_stability, list_model_runs
 from .profiling import load_analysis_outliers
@@ -11,9 +20,9 @@ from .profiling import load_analysis_outliers
 def _run_counts(runs: list[dict[str, Any]]) -> dict[str, int]:
     return {
         "total": len(runs),
-        "valid": sum(1 for r in runs if r["validity_class"] == "valid"),
-        "invalid": sum(1 for r in runs if r["validity_class"] == "invalid"),
-        "valid_with_robust_se": sum(1 for r in runs if r["validity_class"] == "valid_with_robust_se"),
+        "valid": sum(1 for r in runs if r["validity_class"] == VALIDITY_VALID),
+        "invalid": sum(1 for r in runs if r["validity_class"] == VALIDITY_INVALID),
+        "valid_with_robust_se": sum(1 for r in runs if r["validity_class"] == VALIDITY_VALID_WITH_ROBUST_SE),
     }
 
 
@@ -64,8 +73,8 @@ def build_report_html(
         stability_block = f"""
         <h2>Stability Analysis</h2>
         <p>Models used: {stability['summary'].get('n_models_used', 0)} | Include robust: {stability['summary'].get('include_robust', False)}</p>
-        <p>Bucket counts: STABLE={bucket_counts.get('STABLE', 0)}, CONDITIONAL={bucket_counts.get('CONDITIONAL', 0)},
-        NON_EFFECT={bucket_counts.get('NON_EFFECT', 0)}, REDFLAG={bucket_counts.get('REDFLAG', 0)}</p>
+        <p>Bucket counts: STABLE={bucket_counts.get(BUCKET_STABLE, 0)}, CONDITIONAL={bucket_counts.get(BUCKET_CONDITIONAL, 0)},
+        NON_EFFECT={bucket_counts.get(BUCKET_NON_EFFECT, 0)}, REDFLAG={bucket_counts.get(BUCKET_REDFLAG, 0)}</p>
         <table>
           <tr><th>Effect</th><th>Type</th><th>Bucket</th><th>Sign Consistency</th><th>Practical Rate</th></tr>
           {''.join(effects_rows)}
@@ -155,10 +164,10 @@ def build_report_pdf(
             [
                 ["Stable", "Conditional", "Non-effect", "Red-flag"],
                 [
-                    bucket.get("STABLE", 0),
-                    bucket.get("CONDITIONAL", 0),
-                    bucket.get("NON_EFFECT", 0),
-                    bucket.get("REDFLAG", 0),
+                    bucket.get(BUCKET_STABLE, 0),
+                    bucket.get(BUCKET_CONDITIONAL, 0),
+                    bucket.get(BUCKET_NON_EFFECT, 0),
+                    bucket.get(BUCKET_REDFLAG, 0),
                 ],
             ]
         )

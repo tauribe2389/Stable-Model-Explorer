@@ -10,6 +10,14 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from .constants import (
+    ALL_GROUP_KEY,
+    GROUP_MISSING_LEVEL_TOKEN,
+    GROUP_MISSING_POLICY_AS_LEVEL,
+    GROUP_MISSING_POLICY_DROP_ROWS,
+    OUTLIER_DECISION_KEEP,
+    OUTLIER_DECISION_REMOVE,
+)
 from .db import (
     fetchall,
     fetchone,
@@ -19,6 +27,7 @@ from .db import (
     to_json,
     utcnow_iso,
 )
+from .contracts import AnalysisConfig, as_str_list, normalize_analysis_config, normalize_profile_rules
 from .defaults import DEFAULT_PROFILE_RULES
 
 
@@ -28,6 +37,14 @@ class ProfileResult:
     columns: list[dict[str, Any]]
 
 
+_DATASET_COLUMNS_INSERT_SQL = """
+INSERT INTO dataset_columns(
+    dataset_id, column_name, inferred_type, model_role, unique_count, missing_count,
+    numeric_ratio, datetime_ratio, exclude_reason, sample_values_json
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+
 def allowed_roles_for_inferred_type(inferred_type: str) -> list[str]:
     if inferred_type in {"numeric", "datetime"}:
         return ["categorical", "continuous", "excluded"]
@@ -35,9 +52,7 @@ def allowed_roles_for_inferred_type(inferred_type: str) -> list[str]:
 
 
 def merged_rules(custom_rules: dict[str, Any] | None = None) -> dict[str, Any]:
-    rules = dict(DEFAULT_PROFILE_RULES)
-    rules.update(custom_rules or {})
-    return rules
+    return dict(normalize_profile_rules(custom_rules))
 
 
 def _sample_values(series: pd.Series, limit: int = 5) -> list[str]:
@@ -116,6 +131,31 @@ def infer_profiles(df: pd.DataFrame, rules: dict[str, Any] | None = None) -> Pro
     return ProfileResult(schema=schema, columns=columns)
 
 
+def _dataset_column_rows(dataset_id: int, profile_columns: list[dict[str, Any]]) -> list[list[Any]]:
+    return [
+        [
+            dataset_id,
+            col["column_name"],
+            col["inferred_type"],
+            col["model_role"],
+            col["unique_count"],
+            col["missing_count"],
+            col["numeric_ratio"],
+            col["datetime_ratio"],
+            col["exclude_reason"],
+            col["sample_values_json"],
+        ]
+        for col in profile_columns
+    ]
+
+
+def _replace_dataset_columns(conn, dataset_id: int, profile_columns: list[dict[str, Any]]) -> None:
+    conn.execute("DELETE FROM dataset_columns WHERE dataset_id = ?", [dataset_id])
+    rows = _dataset_column_rows(dataset_id, profile_columns)
+    if rows:
+        conn.executemany(_DATASET_COLUMNS_INSERT_SQL, rows)
+
+
 def ingest_dataset(
     db_path: str,
     csv_path: str,
@@ -150,30 +190,7 @@ def ingest_dataset(
     table_name = f"dataset_data_{dataset_id}"
     with get_conn(db_path) as conn:
         conn.execute("UPDATE datasets SET data_table_name = ? WHERE id = ?", [table_name, dataset_id])
-        conn.execute("DELETE FROM dataset_columns WHERE dataset_id = ?", [dataset_id])
-        conn.executemany(
-            """
-            INSERT INTO dataset_columns(
-                dataset_id, column_name, inferred_type, model_role, unique_count, missing_count,
-                numeric_ratio, datetime_ratio, exclude_reason, sample_values_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                [
-                    dataset_id,
-                    col["column_name"],
-                    col["inferred_type"],
-                    col["model_role"],
-                    col["unique_count"],
-                    col["missing_count"],
-                    col["numeric_ratio"],
-                    col["datetime_ratio"],
-                    col["exclude_reason"],
-                    col["sample_values_json"],
-                ]
-                for col in profile.columns
-            ],
-        )
+        _replace_dataset_columns(conn, dataset_id, profile.columns)
         conn.commit()
         df.to_sql(table_name, conn, if_exists="replace", index=False)
         conn.commit()
@@ -188,30 +205,7 @@ def reprofile_dataset(db_path: str, dataset_id: int, rules: dict[str, Any]) -> N
             "UPDATE datasets SET schema_json = ?, profile_rules_json = ?, updated_at = ? WHERE id = ?",
             [to_json(profile.schema), to_json(rules), utcnow_iso(), dataset_id],
         )
-        conn.execute("DELETE FROM dataset_columns WHERE dataset_id = ?", [dataset_id])
-        conn.executemany(
-            """
-            INSERT INTO dataset_columns(
-                dataset_id, column_name, inferred_type, model_role, unique_count, missing_count,
-                numeric_ratio, datetime_ratio, exclude_reason, sample_values_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                [
-                    dataset_id,
-                    col["column_name"],
-                    col["inferred_type"],
-                    col["model_role"],
-                    col["unique_count"],
-                    col["missing_count"],
-                    col["numeric_ratio"],
-                    col["datetime_ratio"],
-                    col["exclude_reason"],
-                    col["sample_values_json"],
-                ]
-                for col in profile.columns
-            ],
-        )
+        _replace_dataset_columns(conn, dataset_id, profile.columns)
         conn.commit()
 
 
@@ -338,15 +332,9 @@ def _series_numeric(df: pd.DataFrame, col: str) -> pd.Series:
 
 def _stringify_group_value(value: Any) -> str:
     if pd.isna(value):
-        return "__NA__"
+        return GROUP_MISSING_LEVEL_TOKEN
     text = str(value)
-    return text if text != "" else "__NA__"
-
-
-def _group_label(row: pd.Series, group_vars: list[str]) -> str:
-    if not group_vars:
-        return "__ALL__"
-    return "|".join(f"{g}={_stringify_group_value(row[g])}" for g in group_vars)
+    return text if text != "" else GROUP_MISSING_LEVEL_TOKEN
 
 
 def _group_values_from_parts(group_vars: list[str], key_parts: tuple[Any, ...] | Any) -> dict[str, str]:
@@ -363,7 +351,7 @@ def _group_values_from_parts(group_vars: list[str], key_parts: tuple[Any, ...] |
 
 def _group_key_from_values(group_vars: list[str], values: dict[str, Any]) -> str:
     if not group_vars:
-        return "__ALL__"
+        return ALL_GROUP_KEY
     return "|".join(f"{g}={_stringify_group_value(values.get(g))}" for g in group_vars)
 
 
@@ -376,9 +364,9 @@ def build_group_manifest(
     min_primary_level_n: int,
     max_groups_analyzed: int,
     include_unobserved: bool = False,
-    missing_policy: str = "AS_LEVEL",
+    missing_policy: str = GROUP_MISSING_POLICY_AS_LEVEL,
 ) -> dict[str, Any]:
-    missing_policy = str(missing_policy or "AS_LEVEL").strip().upper()
+    missing_policy = str(missing_policy or GROUP_MISSING_POLICY_AS_LEVEL).strip().upper()
     max_groups = max(1, int(max_groups_analyzed))
     min_rows_per_group = max(1, int(min_rows_per_group))
     min_primary_level_n = max(1, int(min_primary_level_n))
@@ -390,7 +378,7 @@ def build_group_manifest(
 
     rows_dropped_missing_group = 0
     if group_variables:
-        if missing_policy == "DROP_ROWS":
+        if missing_policy == GROUP_MISSING_POLICY_DROP_ROWS:
             missing_mask = source[group_variables].isna().any(axis=1)
             rows_dropped_missing_group = int(missing_mask.sum())
             source = source.loc[~missing_mask].copy()
@@ -402,7 +390,7 @@ def build_group_manifest(
     row_group_map: list[dict[str, Any]] = []
 
     if not group_variables:
-        group_key = "__ALL__"
+        group_key = ALL_GROUP_KEY
         rows_raw = rows_considered
         response_numeric_rows = int(pd.to_numeric(source.get(response, pd.Series(dtype=float)), errors="coerce").notna().sum())
         primary_stats: dict[str, dict[str, Any]] = {}
@@ -486,7 +474,7 @@ def build_group_manifest(
             level_sets = []
             for col in group_variables:
                 vals = sorted({_stringify_group_value(v) for v in source[col].tolist()})
-                level_sets.append(vals if vals else ["__NA__"])
+                level_sets.append(vals if vals else [GROUP_MISSING_LEVEL_TOKEN])
             for combo in itertools.product(*level_sets):
                 group_values = {group_variables[i]: combo[i] for i in range(len(group_variables))}
                 group_key = _group_key_from_values(group_variables, group_values)
@@ -903,7 +891,7 @@ def compute_health_checks(
                 f"coverage={float(group_summary.get('coverage_rows', 0.0)) * 100:.1f}%"
             )
         else:
-            temp = df[group_variables].fillna("__NA__")
+            temp = df[group_variables].fillna(GROUP_MISSING_LEVEL_TOKEN)
             group_sizes = temp.groupby(group_variables).size().reset_index(name="count")
             min_group = int(group_sizes["count"].min()) if len(group_sizes) else 0
             detail = f"Min group size={min_group}, required>={min_rows_per_group}"
@@ -955,7 +943,7 @@ def detect_group_outliers(
             work[col] = work[col].map(_stringify_group_value)
         grouped = list(work.groupby(group_variables, sort=False))
     else:
-        grouped = [("__ALL__", work)]
+        grouped = [(ALL_GROUP_KEY, work)]
 
     flagged: list[dict[str, Any]] = []
     for key, grp in grouped:
@@ -968,8 +956,8 @@ def detect_group_outliers(
         mask = np.abs(rz) > threshold
         if not mask.any():
             continue
-        if key == "__ALL__":
-            label = "__ALL__"
+        if key == ALL_GROUP_KEY:
+            label = ALL_GROUP_KEY
         else:
             label = _group_key_from_values(group_variables, _group_values_from_parts(group_variables, key))
         for row_idx, z in zip(grp.loc[mask, "row_index"], rz[mask]):
@@ -979,7 +967,7 @@ def detect_group_outliers(
                     "group_key": label,
                     "variable": response,
                     "robust_z": float(z),
-                    "decision": "keep",
+                    "decision": OUTLIER_DECISION_KEEP,
                     "reason": f"|robust_z|>{threshold} (MAD within group)",
                     "created_at": utcnow_iso(),
                 }
@@ -1036,8 +1024,8 @@ def load_analysis_outliers(db_path: str, analysis_id: int) -> list[dict[str, Any
 def excluded_row_indices(db_path: str, analysis_id: int) -> set[int]:
     rows = fetchall(
         db_path,
-        "SELECT row_index FROM analysis_outliers WHERE analysis_id = ? AND decision = 'remove'",
-        [analysis_id],
+        "SELECT row_index FROM analysis_outliers WHERE analysis_id = ? AND decision = ?",
+        [analysis_id, OUTLIER_DECISION_REMOVE],
     )
     return {int(r["row_index"]) for r in rows}
 
@@ -1045,12 +1033,17 @@ def excluded_row_indices(db_path: str, analysis_id: int) -> set[int]:
 def build_screening_bundle(
     df: pd.DataFrame,
     columns_meta: list[dict[str, Any]],
-    config: dict[str, Any],
+    config: AnalysisConfig | dict[str, Any],
 ) -> dict[str, Any]:
+    config = normalize_analysis_config(config)
     response = config["response"]
     univariate = compute_univariate_screening(df, columns_meta, response)
     categorical_pool = [c["column_name"] for c in columns_meta if c["model_role"] == "categorical"]
-    covariates = list(dict.fromkeys(config.get("categorical_covariates", []) + config.get("continuous_covariates", [])))
+    covariates = list(
+        dict.fromkeys(
+            as_str_list(config.get("categorical_covariates")) + as_str_list(config.get("continuous_covariates"))
+        )
+    )
     confounding = compute_confounding_map(df, categorical_pool, covariates, columns_meta)
-    collinear = compute_collinearity_clusters(df, config.get("continuous_covariates", []))
+    collinear = compute_collinearity_clusters(df, as_str_list(config.get("continuous_covariates")))
     return {"univariate": univariate, "confounding": confounding, "collinearity": collinear}

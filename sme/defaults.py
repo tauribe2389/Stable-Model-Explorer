@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .constants import GROUP_MISSING_POLICY_AS_LEVEL
+
 
 DEFAULT_PROFILE_RULES = {
     "categorical_max_cardinality": 20,
@@ -15,7 +17,7 @@ DEFAULT_ANALYSIS_CONFIG = {
     "primary_factors": [],
     "group_variables": [],
     "group_include_unobserved_combinations": False,
-    "group_missing_policy": "AS_LEVEL",
+    "group_missing_policy": GROUP_MISSING_POLICY_AS_LEVEL,
     "group_max_groups_analyzed": 25,
     "group_min_primary_level_n": 5,
     "categorical_covariates": [],

@@ -2,7 +2,7 @@ from pathlib import Path
 
 from flask import Flask
 
-from .db import ensure_db
+from .db import ensure_schema, run_startup_maintenance
 from .routes import bp
 
 
@@ -22,6 +22,8 @@ def create_app() -> Flask:
         ARTIFACT_DIR="artifacts",
     )
 
-    ensure_db(app.config["DATABASE"])
+    ensure_schema(app.config["DATABASE"])
+    maintenance_result = run_startup_maintenance(app.config["DATABASE"])
+    app.config["DB_STARTUP_MAINTENANCE"] = maintenance_result
     app.register_blueprint(bp)
     return app

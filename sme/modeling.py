@@ -16,6 +16,26 @@ from scipy import stats
 from statsmodels.stats.diagnostic import het_breuschpagan
 from statsmodels.stats.outliers_influence import OLSInfluence, variance_inflation_factor
 
+from .constants import (
+    ALL_GROUP_KEY,
+    ANALYSIS_STATUS_MODELS_RAN,
+    ANALYSIS_STATUS_STABILITY_COMPLETE,
+    BUCKET_CONDITIONAL,
+    BUCKET_NON_EFFECT,
+    BUCKET_REDFLAG,
+    BUCKET_STABLE,
+    MODEL_CLASS_ANCOVA,
+    MODEL_CLASS_ANOVA,
+    MODEL_REGISTRY_STATUS_COMPLETED,
+    MODEL_REGISTRY_STATUS_QUEUED,
+    MODEL_RUN_STATUS_COMPLETED,
+    MODEL_RUN_STATUS_FAILED,
+    ROBUST_SE_MODES,
+    VALIDITY_INVALID,
+    VALIDITY_VALID,
+    VALIDITY_VALID_WITH_ROBUST_SE,
+)
+from .contracts import AnalysisConfig, as_str_list, normalize_analysis_config
 from .db import fetchall, fetchone, from_json, get_conn, to_json, utcnow_iso
 from .profiling import (
     excluded_row_indices,
@@ -50,19 +70,14 @@ def _sanitize_selection(names: list[str], all_columns: set[str]) -> list[str]:
     return [n for n in names if n in all_columns]
 
 
-def _as_list(value: Any) -> list[str]:
-    if isinstance(value, list):
-        return [str(v) for v in value if str(v).strip()]
-    return []
-
-
 def generate_model_registry(
     db_path: str,
     analysis_id: int,
-    config: dict[str, Any],
+    config: AnalysisConfig | dict[str, Any],
     columns_meta: list[dict[str, Any]],
     group_keys: list[str] | None = None,
 ) -> list[dict[str, Any]]:
+    config = normalize_analysis_config(config)
     all_cols = {c["column_name"] for c in columns_meta}
     role_by_col = {c["column_name"]: c["model_role"] for c in columns_meta}
     categorical_names = {c["column_name"] for c in columns_meta if c["model_role"] == "categorical"}
@@ -71,15 +86,15 @@ def generate_model_registry(
     if response not in all_cols:
         raise ValueError("Response column missing from dataset.")
 
-    primary = _sanitize_selection(_as_list(config.get("primary_factors")), all_cols)
-    forced_terms = _sanitize_selection(_as_list(config.get("forced_terms")), all_cols)
+    primary = _sanitize_selection(as_str_list(config.get("primary_factors")), all_cols)
+    forced_terms = _sanitize_selection(as_str_list(config.get("forced_terms")), all_cols)
     forced = list(dict.fromkeys(primary + forced_terms))
-    categorical_cov = _sanitize_selection(_as_list(config.get("categorical_covariates")), all_cols)
-    continuous_cov = _sanitize_selection(_as_list(config.get("continuous_covariates")), all_cols)
+    categorical_cov = _sanitize_selection(as_str_list(config.get("categorical_covariates")), all_cols)
+    continuous_cov = _sanitize_selection(as_str_list(config.get("continuous_covariates")), all_cols)
     optional_terms = [x for x in dict.fromkeys(categorical_cov + continuous_cov) if x not in forced and x != response]
     interaction_candidates = [
         i
-        for i in _as_list(config.get("interaction_candidates"))
+        for i in as_str_list(config.get("interaction_candidates"))
         if all(p.strip() in all_cols for p in i.split(":"))
     ]
 
@@ -109,11 +124,15 @@ def generate_model_registry(
                     inter_subsets.extend(itertools.combinations(available_interactions, ik))
             for inter_subset in inter_subsets:
                 expr_terms = [term_expr(t, categorical_names) for t in terms]
-                inter_exprs = [interaction_expr(i, categorical_names) for i in inter_subset if interaction_expr(i, categorical_names)]
+                inter_exprs = []
+                for interaction in inter_subset:
+                    expr = interaction_expr(interaction, categorical_names)
+                    if expr:
+                        inter_exprs.append(expr)
                 rhs = " + ".join(expr_terms + inter_exprs)
                 formula = f"{quote_name(response)} ~ {rhs}"
                 has_cont = any(role_by_col.get(t) == "continuous" for t in terms if t != response)
-                model_class = "ANCOVA" if has_cont else "ANOVA"
+                model_class = MODEL_CLASS_ANCOVA if has_cont else MODEL_CLASS_ANOVA
                 combos.append(
                     {
                         "formula": formula,
@@ -130,7 +149,7 @@ def generate_model_registry(
             combos = [
                 {
                     "formula": formula,
-                    "model_class": "ANOVA",
+                    "model_class": MODEL_CLASS_ANOVA,
                     "included_terms": baseline_terms,
                     "interactions": [],
                 }
@@ -148,10 +167,10 @@ def generate_model_registry(
         group_rows = load_analysis_groups(db_path, analysis_id, selected_only=True)
         selected_groups = [str(g["group_key"]) for g in group_rows if str(g.get("group_key", "")).strip()]
     if not selected_groups:
-        if _as_list(config.get("group_variables")):
+        if as_str_list(config.get("group_variables")):
             selected_groups = []
         else:
-            selected_groups = ["__ALL__"]
+            selected_groups = [ALL_GROUP_KEY]
 
     registry_rows: list[list[Any]] = []
     model_idx = 1
@@ -167,6 +186,7 @@ def generate_model_registry(
                     combo["model_class"],
                     to_json(combo["included_terms"]),
                     to_json(combo["interactions"]),
+                    MODEL_REGISTRY_STATUS_QUEUED,
                     utcnow_iso(),
                 ]
             )
@@ -179,7 +199,7 @@ def generate_model_registry(
                 """
                 INSERT INTO model_registry(
                     analysis_id, model_idx, base_model_idx, group_key, formula, model_class, included_terms_json, interactions_json, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 registry_rows,
             )
@@ -196,7 +216,7 @@ def load_registry(db_path: str, analysis_id: int) -> list[dict[str, Any]]:
     out = []
     for r in rows:
         rec = dict(r)
-        rec["group_key"] = str(rec.get("group_key") or "__ALL__")
+        rec["group_key"] = str(rec.get("group_key") or ALL_GROUP_KEY)
         rec["base_model_idx"] = int(rec.get("base_model_idx") or rec.get("model_idx") or 0)
         rec["included_terms"] = from_json(rec["included_terms_json"], [])
         rec["interactions"] = from_json(rec["interactions_json"], [])
@@ -364,9 +384,10 @@ def run_registry_models(
     db_path: str,
     artifact_dir: str,
     analysis_id: int,
-    config: dict[str, Any],
+    config: AnalysisConfig | dict[str, Any],
     columns_meta: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    config = normalize_analysis_config(config)
     analysis = fetchone(db_path, "SELECT * FROM analyses WHERE id = ?", [analysis_id])
     if not analysis:
         raise ValueError(f"Unknown analysis_id={analysis_id}")
@@ -376,12 +397,12 @@ def run_registry_models(
     update_group_post_outlier_counts(db_path, analysis_id, excluded_rows=excluded_rows)
     group_row_map = load_analysis_group_row_map(db_path, analysis_id, selected_only=True)
     if not group_row_map:
-        group_row_map = {"__ALL__": {int(x) for x in df["row_index"].tolist()}}
+        group_row_map = {ALL_GROUP_KEY: {int(x) for x in df["row_index"].tolist()}}
     registry = load_registry(db_path, analysis_id)
     robust_mode = str(config.get("robust_se_mode", "")).strip().upper()
-    use_robust = robust_mode in {"HC0", "HC1", "HC2", "HC3"}
+    use_robust = robust_mode in ROBUST_SE_MODES
     response = config["response"]
-    primary_factors = _as_list(config.get("primary_factors"))
+    primary_factors = as_str_list(config.get("primary_factors"))
     shapiro_fail_alpha = float(config.get("shapiro_fail_alpha", 0.01))
     shapiro_warn_alpha = float(config.get("shapiro_warn_alpha", 0.05))
     bp_alpha = float(config.get("bp_alpha", 0.05))
@@ -390,163 +411,160 @@ def run_registry_models(
     cook_mul = float(config.get("cook_threshold_multiplier", 4.0))
     cook_fail = bool(config.get("cook_fail", False))
 
+    counts = {"total": len(registry), "valid": 0, "invalid": 0, "valid_with_robust_se": 0}
     with get_conn(db_path) as conn:
         conn.execute("DELETE FROM model_runs WHERE analysis_id = ?", [analysis_id])
-        conn.commit()
-
-    counts = {"total": len(registry), "valid": 0, "invalid": 0, "valid_with_robust_se": 0}
-    for reg in registry:
-        invalid_reasons: list[str] = []
-        warnings: list[str] = []
-        metrics: dict[str, Any] = {}
-        coeffs: dict[str, float] = {}
-        pvals: dict[str, float] = {}
-        ci: dict[str, list[float]] = {}
-        anova_table: list[dict[str, Any]] = []
-        lsmeans: dict[str, Any] = {}
-        cooks_payload: list[dict[str, Any]] = []
-        residual_diag: dict[str, Any] = {}
-        artifacts: dict[str, str] = {}
-        n_obs = 0
-        status = "completed"
-        validity_class = "invalid"
-        try:
-            terms = reg["included_terms"]
-            group_key = str(reg.get("group_key") or "__ALL__")
-            include_rows = group_row_map.get(group_key, set())
-            if not include_rows:
-                invalid_reasons.append(f"No rows available for selected group: {group_key}")
-                raise ValueError("No rows in group")
-            model_df = _prepare_dataframe_for_model(
-                df,
-                columns_meta,
-                response,
-                terms,
-                excluded_rows,
-                include_rows=include_rows,
-            )
-            n_obs = int(len(model_df))
-            if n_obs < 8:
-                invalid_reasons.append("Insufficient rows after exclusions and NA drop.")
-                raise ValueError("Insufficient rows")
-
-            fit = smf.ols(reg["formula"], data=model_df).fit()
-            residuals = fit.resid
-            exog = fit.model.exog
-            exog_names = fit.model.exog_names
-
+        for reg in registry:
+            invalid_reasons: list[str] = []
+            warnings: list[str] = []
+            metrics: dict[str, Any] = {}
+            coeffs: dict[str, float] = {}
+            pvals: dict[str, float] = {}
+            ci: dict[str, list[float]] = {}
+            anova_table: list[dict[str, Any]] = []
+            lsmeans: dict[str, Any] = {}
+            cooks_payload: list[dict[str, Any]] = []
+            residual_diag: dict[str, Any] = {}
+            artifacts: dict[str, str] = {}
+            n_obs = 0
+            status = MODEL_RUN_STATUS_COMPLETED
+            validity_class = VALIDITY_INVALID
             try:
-                bp_stat, bp_p, _, _ = het_breuschpagan(residuals, exog)
-                metrics["bp_stat"] = float(bp_stat)
-                metrics["bp_p"] = float(bp_p)
-            except Exception as exc:
-                warnings.append(f"Breusch-Pagan unavailable: {exc}")
-                bp_p = 1.0
-                metrics["bp_p"] = 1.0
+                terms = reg["included_terms"]
+                group_key = str(reg.get("group_key") or ALL_GROUP_KEY)
+                include_rows = group_row_map.get(group_key, set())
+                if not include_rows:
+                    invalid_reasons.append(f"No rows available for selected group: {group_key}")
+                    raise ValueError("No rows in group")
+                model_df = _prepare_dataframe_for_model(
+                    df,
+                    columns_meta,
+                    response,
+                    terms,
+                    excluded_rows,
+                    include_rows=include_rows,
+                )
+                n_obs = int(len(model_df))
+                if n_obs < 8:
+                    invalid_reasons.append("Insufficient rows after exclusions and NA drop.")
+                    raise ValueError("Insufficient rows")
 
-            try:
-                resid_arr = np.asarray(residuals)
-                if len(resid_arr) <= 5000:
-                    sample = resid_arr
-                else:
-                    rng = np.random.RandomState(13)
-                    sample = rng.choice(resid_arr, size=5000, replace=False)
-                shap_stat, shap_p = stats.shapiro(sample)
-                metrics["shapiro_stat"] = float(shap_stat)
-                metrics["shapiro_p"] = float(shap_p)
-                if shap_p < shapiro_fail_alpha:
-                    warnings.append("Residual normality likely violated (Shapiro below fail alpha).")
-                elif shap_p < shapiro_warn_alpha:
-                    warnings.append("Residual normality warning (Shapiro below warn alpha).")
-            except Exception as exc:
-                warnings.append(f"Shapiro unavailable: {exc}")
+                fit = smf.ols(reg["formula"], data=model_df).fit()
+                residuals = fit.resid
+                exog = fit.model.exog
+                exog_names = fit.model.exog_names
 
-            vifs = _compute_vif(exog, exog_names)
-            metrics["vif"] = vifs
-            max_vif = max((v["vif"] for v in vifs), default=0.0)
-            metrics["max_vif"] = float(max_vif)
-            if max_vif >= vif_fail:
-                invalid_reasons.append(f"VIF exceeds fail threshold ({max_vif:.2f} >= {vif_fail}).")
-            elif max_vif >= vif_warn:
-                warnings.append(f"VIF warning ({max_vif:.2f} >= {vif_warn}).")
+                try:
+                    bp_stat, bp_p, _, _ = het_breuschpagan(residuals, exog)
+                    metrics["bp_stat"] = float(bp_stat)
+                    metrics["bp_p"] = float(bp_p)
+                except Exception as exc:
+                    warnings.append(f"Breusch-Pagan unavailable: {exc}")
+                    bp_p = 1.0
+                    metrics["bp_p"] = 1.0
 
-            influence = OLSInfluence(fit)
-            cooks = influence.cooks_distance[0]
-            cook_threshold = cook_mul / max(1, n_obs)
-            high_mask = cooks > cook_threshold
-            high_count = int(np.sum(high_mask))
-            metrics["cook_threshold"] = float(cook_threshold)
-            metrics["max_cook"] = float(np.max(cooks)) if len(cooks) else 0.0
-            metrics["high_cook_count"] = high_count
-            if high_count > 0:
-                msg = f"{high_count} points above Cook threshold {cook_threshold:.4f}"
-                if cook_fail:
-                    invalid_reasons.append(msg)
-                else:
-                    warnings.append(msg)
-            cooks_payload = [
-                {
-                    "row_index": int(row_idx),
-                    "cooks_distance": float(cook),
-                    "high_leverage_flag": bool(cook > cook_threshold),
-                }
-                for row_idx, cook in zip(model_df["row_index"], cooks)
-            ]
+                try:
+                    resid_arr = np.asarray(residuals)
+                    if len(resid_arr) <= 5000:
+                        sample = resid_arr
+                    else:
+                        rng = np.random.RandomState(13)
+                        sample = rng.choice(resid_arr, size=5000, replace=False)
+                    shap_stat, shap_p = stats.shapiro(sample)
+                    metrics["shapiro_stat"] = float(shap_stat)
+                    metrics["shapiro_p"] = float(shap_p)
+                    if shap_p < shapiro_fail_alpha:
+                        warnings.append("Residual normality likely violated (Shapiro below fail alpha).")
+                    elif shap_p < shapiro_warn_alpha:
+                        warnings.append("Residual normality warning (Shapiro below warn alpha).")
+                except Exception as exc:
+                    warnings.append(f"Shapiro unavailable: {exc}")
 
-            if bp_p < bp_alpha:
-                if use_robust:
-                    warnings.append("Heteroscedasticity detected; robust SE applied.")
-                else:
-                    invalid_reasons.append("Breusch-Pagan indicates heteroscedasticity.")
+                vifs = _compute_vif(exog, exog_names)
+                metrics["vif"] = vifs
+                max_vif = max((v["vif"] for v in vifs), default=0.0)
+                metrics["max_vif"] = float(max_vif)
+                if max_vif >= vif_fail:
+                    invalid_reasons.append(f"VIF exceeds fail threshold ({max_vif:.2f} >= {vif_fail}).")
+                elif max_vif >= vif_warn:
+                    warnings.append(f"VIF warning ({max_vif:.2f} >= {vif_warn}).")
 
-            coeffs, pvals, ci = _coef_dict_from_fit(fit, robust_mode if use_robust else None, apply_robust=use_robust)
-            metrics["r2"] = float(fit.rsquared)
-            metrics["adj_r2"] = float(fit.rsquared_adj)
-            metrics["aic"] = float(fit.aic)
-            metrics["bic"] = float(fit.bic)
-
-            try:
-                anova_df = sm.stats.anova_lm(fit, typ=2)
-                anova_table = [
+                influence = OLSInfluence(fit)
+                cooks = influence.cooks_distance[0]
+                cook_threshold = cook_mul / max(1, n_obs)
+                high_mask = cooks > cook_threshold
+                high_count = int(np.sum(high_mask))
+                metrics["cook_threshold"] = float(cook_threshold)
+                metrics["max_cook"] = float(np.max(cooks)) if len(cooks) else 0.0
+                metrics["high_cook_count"] = high_count
+                if high_count > 0:
+                    msg = f"{high_count} points above Cook threshold {cook_threshold:.4f}"
+                    if cook_fail:
+                        invalid_reasons.append(msg)
+                    else:
+                        warnings.append(msg)
+                cooks_payload = [
                     {
-                        "term": str(idx),
-                        "sum_sq": float(row["sum_sq"]) if "sum_sq" in row else None,
-                        "df": float(row["df"]) if "df" in row else None,
-                        "f": float(row["F"]) if "F" in row and not pd.isna(row["F"]) else None,
-                        "p": float(row["PR(>F)"]) if "PR(>F)" in row and not pd.isna(row["PR(>F)"]) else None,
+                        "row_index": int(row_idx),
+                        "cooks_distance": float(cook),
+                        "high_leverage_flag": bool(cook > cook_threshold),
                     }
-                    for idx, row in anova_df.iterrows()
+                    for row_idx, cook in zip(model_df["row_index"], cooks)
                 ]
+
+                if bp_p < bp_alpha:
+                    if use_robust:
+                        warnings.append("Heteroscedasticity detected; robust SE applied.")
+                    else:
+                        invalid_reasons.append("Breusch-Pagan indicates heteroscedasticity.")
+
+                coeffs, pvals, ci = _coef_dict_from_fit(fit, robust_mode if use_robust else None, apply_robust=use_robust)
+                metrics["r2"] = float(fit.rsquared)
+                metrics["adj_r2"] = float(fit.rsquared_adj)
+                metrics["aic"] = float(fit.aic)
+                metrics["bic"] = float(fit.bic)
+
+                try:
+                    anova_df = sm.stats.anova_lm(fit, typ=2)
+                    anova_table = [
+                        {
+                            "term": str(idx),
+                            "sum_sq": float(row["sum_sq"]) if "sum_sq" in row else None,
+                            "df": float(row["df"]) if "df" in row else None,
+                            "f": float(row["F"]) if "F" in row and not pd.isna(row["F"]) else None,
+                            "p": float(row["PR(>F)"]) if "PR(>F)" in row and not pd.isna(row["PR(>F)"]) else None,
+                        }
+                        for idx, row in anova_df.iterrows()
+                    ]
+                except Exception as exc:
+                    warnings.append(f"ANOVA table unavailable: {exc}")
+
+                lsmeans = _extract_lsmeans(fit, model_df, primary_factors, columns_meta, response)
+                residual_diag = {
+                    "residual_mean": float(np.mean(residuals)),
+                    "residual_std": float(np.std(residuals)),
+                }
+                artifacts = _save_diagnostic_plots(artifact_dir, analysis_id, int(reg["model_idx"]), fit)
+
+                if invalid_reasons:
+                    validity_class = VALIDITY_INVALID
+                elif bp_p < bp_alpha and use_robust:
+                    validity_class = VALIDITY_VALID_WITH_ROBUST_SE
+                else:
+                    validity_class = VALIDITY_VALID
             except Exception as exc:
-                warnings.append(f"ANOVA table unavailable: {exc}")
+                if not invalid_reasons:
+                    invalid_reasons.append(f"Model fit failed: {exc}")
+                status = MODEL_RUN_STATUS_FAILED
+                validity_class = VALIDITY_INVALID
 
-            lsmeans = _extract_lsmeans(fit, model_df, primary_factors, columns_meta, response)
-            residual_diag = {
-                "residual_mean": float(np.mean(residuals)),
-                "residual_std": float(np.std(residuals)),
-            }
-            artifacts = _save_diagnostic_plots(artifact_dir, analysis_id, int(reg["model_idx"]), fit)
-
-            if invalid_reasons:
-                validity_class = "invalid"
-            elif bp_p < bp_alpha and use_robust:
-                validity_class = "valid_with_robust_se"
+            if validity_class == VALIDITY_VALID:
+                counts["valid"] += 1
+            elif validity_class == VALIDITY_VALID_WITH_ROBUST_SE:
+                counts["valid_with_robust_se"] += 1
             else:
-                validity_class = "valid"
-        except Exception as exc:
-            if not invalid_reasons:
-                invalid_reasons.append(f"Model fit failed: {exc}")
-            status = "failed"
-            validity_class = "invalid"
+                counts["invalid"] += 1
 
-        if validity_class == "valid":
-            counts["valid"] += 1
-        elif validity_class == "valid_with_robust_se":
-            counts["valid_with_robust_se"] += 1
-        else:
-            counts["invalid"] += 1
-
-        with get_conn(db_path) as conn:
             conn.execute(
                 """
                 INSERT INTO model_runs(
@@ -578,7 +596,7 @@ def run_registry_models(
                     utcnow_iso(),
                     status,
                     validity_class,
-                    str(reg.get("group_key") or "__ALL__"),
+                    str(reg.get("group_key") or ALL_GROUP_KEY),
                     to_json(invalid_reasons),
                     to_json(warnings),
                     to_json(metrics),
@@ -593,9 +611,12 @@ def run_registry_models(
                     n_obs,
                 ],
             )
-            conn.execute("UPDATE model_registry SET status = 'completed' WHERE id = ?", [reg["id"]])
-            conn.execute("UPDATE analyses SET status = 'models_ran', updated_at = ? WHERE id = ?", [utcnow_iso(), analysis_id])
-            conn.commit()
+            conn.execute("UPDATE model_registry SET status = ? WHERE id = ?", [MODEL_REGISTRY_STATUS_COMPLETED, reg["id"]])
+        conn.execute(
+            "UPDATE analyses SET status = ?, updated_at = ? WHERE id = ?",
+            [ANALYSIS_STATUS_MODELS_RAN, utcnow_iso(), analysis_id],
+        )
+        conn.commit()
     return counts
 
 
@@ -605,7 +626,7 @@ def list_model_runs(db_path: str, analysis_id: int) -> list[dict[str, Any]]:
         """
         SELECT
             mr.*,
-            COALESCE(mr.group_key, rg.group_key, '__ALL__') AS group_key,
+            COALESCE(mr.group_key, rg.group_key, ?) AS group_key,
             rg.model_idx,
             rg.base_model_idx,
             rg.formula,
@@ -617,12 +638,12 @@ def list_model_runs(db_path: str, analysis_id: int) -> list[dict[str, Any]]:
         WHERE mr.analysis_id = ?
         ORDER BY rg.model_idx
         """,
-        [analysis_id],
+        [ALL_GROUP_KEY, analysis_id],
     )
     out = []
     for r in rows:
         rec = dict(r)
-        rec["group_key"] = str(rec.get("group_key") or "__ALL__")
+        rec["group_key"] = str(rec.get("group_key") or ALL_GROUP_KEY)
         rec["base_model_idx"] = int(rec.get("base_model_idx") or rec.get("model_idx") or 0)
         rec["invalid_reasons"] = from_json(rec["invalid_reasons_json"], [])
         rec["warnings"] = from_json(rec["warnings_json"], [])
@@ -705,7 +726,7 @@ def _bucket_effect(
     has_sensitivity: bool,
 ) -> tuple[str, float, float, float]:
     if not values:
-        return "NON_EFFECT", 1.0, 0.0, 1.0
+        return BUCKET_NON_EFFECT, 1.0, 0.0, 1.0
     arr = np.array(values, dtype=float)
     pos_rate = float(np.mean(arr > 0))
     neg_rate = float(np.mean(arr < 0))
@@ -715,12 +736,12 @@ def _bucket_effect(
     has_sign_flip = pos_rate > 0 and neg_rate > 0
 
     if has_sign_flip and sign_consistency < redflag_sign_pct:
-        return "REDFLAG", sign_consistency, practical_rate, equivalence_rate
+        return BUCKET_REDFLAG, sign_consistency, practical_rate, equivalence_rate
     if equivalence_rate >= non_effect_pct:
-        return "NON_EFFECT", sign_consistency, practical_rate, equivalence_rate
+        return BUCKET_NON_EFFECT, sign_consistency, practical_rate, equivalence_rate
     if sign_consistency >= stable_sign_pct and practical_rate >= stable_practical_pct and not has_sensitivity:
-        return "STABLE", sign_consistency, practical_rate, equivalence_rate
-    return "CONDITIONAL", sign_consistency, practical_rate, equivalence_rate
+        return BUCKET_STABLE, sign_consistency, practical_rate, equivalence_rate
+    return BUCKET_CONDITIONAL, sign_consistency, practical_rate, equivalence_rate
 
 
 def _safe_slug(text: str, max_len: int = 80) -> str:
@@ -834,16 +855,16 @@ def _bucket_from_metrics(
     thresholds: dict[str, Any],
 ) -> str:
     if has_sign_flip and sign_consistency < float(thresholds["sign_flip_redflag_pct"]):
-        return "REDFLAG"
+        return BUCKET_REDFLAG
     if equivalence_rate >= float(thresholds["non_effect_pct"]):
-        return "NON_EFFECT"
+        return BUCKET_NON_EFFECT
     if (
         sign_consistency >= float(thresholds["stable_sign_pct"])
         and practical_rate >= float(thresholds["stable_practical_pct"])
         and not has_sensitivity
     ):
-        return "STABLE"
-    return "CONDITIONAL"
+        return BUCKET_STABLE
+    return BUCKET_CONDITIONAL
 
 
 def _weighted_quantile(value_weight_pairs: list[tuple[float, float]], quantile: float) -> float:
@@ -887,7 +908,7 @@ def _weighted_effect_metrics(
 ) -> dict[str, Any]:
     if not value_weight_pairs:
         return {
-            "bucket": "NON_EFFECT",
+            "bucket": BUCKET_NON_EFFECT,
             "sign_consistency": 1.0,
             "practical_rate": 0.0,
             "equivalence_rate": 1.0,
@@ -938,15 +959,16 @@ def _weighted_effect_metrics(
 def run_stability_analysis(
     db_path: str,
     analysis_id: int,
-    config: dict[str, Any],
+    config: AnalysisConfig | dict[str, Any],
     include_robust: bool,
     artifact_dir: str = "artifacts",
 ) -> dict[str, Any]:
+    config = normalize_analysis_config(config)
     all_runs = list_model_runs(db_path, analysis_id)
     if include_robust:
-        selected = [r for r in all_runs if r["validity_class"] in {"valid", "valid_with_robust_se"}]
+        selected = [r for r in all_runs if r["validity_class"] in {VALIDITY_VALID, VALIDITY_VALID_WITH_ROBUST_SE}]
     else:
-        selected = [r for r in all_runs if r["validity_class"] == "valid"]
+        selected = [r for r in all_runs if r["validity_class"] == VALIDITY_VALID]
 
     thresholds = {
         "engineering_delta": float(config.get("engineering_delta", 0.1)),
@@ -956,10 +978,10 @@ def run_stability_analysis(
         "non_effect_pct": float(config.get("non_effect_pct", 0.8)),
         "sign_flip_redflag_pct": float(config.get("sign_flip_redflag_pct", 0.6)),
     }
-    continuous_covariates = _as_list(config.get("continuous_covariates"))
-    categorical_covariates = _as_list(config.get("categorical_covariates"))
-    primary_factors = _as_list(config.get("primary_factors"))
-    interaction_candidates = _as_list(config.get("interaction_candidates"))
+    continuous_covariates = as_str_list(config.get("continuous_covariates"))
+    categorical_covariates = as_str_list(config.get("categorical_covariates"))
+    primary_factors = as_str_list(config.get("primary_factors"))
+    interaction_candidates = as_str_list(config.get("interaction_candidates"))
     candidate_covs = list(dict.fromkeys(categorical_covariates + continuous_covariates))
     plot_dir = _stability_plot_dir(artifact_dir, analysis_id)
 
@@ -972,7 +994,7 @@ def run_stability_analysis(
         interaction_map: dict[str, dict[str, Any]] = {}
 
         for run in run_subset:
-            model_class = str(run.get("model_class", "ANOVA"))
+            model_class = str(run.get("model_class", MODEL_CLASS_ANOVA))
             included_terms = run.get("included_terms", [])
             coeffs = run.get("coeffs", {})
             pvalues = run.get("pvalues", {})
@@ -1113,7 +1135,7 @@ def run_stability_analysis(
         for key, slot in rank_map.items():
             dist = _estimate_distribution(slot["values"])
             iqr = dist["iqr"]
-            bucket = "STABLE" if iqr <= 1.0 else "CONDITIONAL"
+            bucket = BUCKET_STABLE if iqr <= 1.0 else BUCKET_CONDITIONAL
             effects.append({
                 "effect_id": key,
                 "effect_type": "RANKING",
@@ -1167,7 +1189,7 @@ def run_stability_analysis(
                 "equivalence_rate": equivalence_rate,
                 "p_sig_rate": None,
                 "sensitivity_flags": sens,
-                "bucket": "CONDITIONAL" if bucket == "STABLE" else bucket,
+                "bucket": BUCKET_CONDITIONAL if bucket == BUCKET_STABLE else bucket,
                 "plot_path": None,
                 "narrative": f"Interaction {slot['interaction']} signals conditional behavior.",
                 "stratified_summaries": _stratified_metrics(slot["class_values"], {}, thresholds),
@@ -1189,10 +1211,10 @@ def run_stability_analysis(
             "effects": effects,
             "effect_data": effect_data,
             "bucket_counts": {
-                "STABLE": sum(1 for e in effects if e["bucket"] == "STABLE"),
-                "CONDITIONAL": sum(1 for e in effects if e["bucket"] == "CONDITIONAL"),
-                "NON_EFFECT": sum(1 for e in effects if e["bucket"] == "NON_EFFECT"),
-                "REDFLAG": sum(1 for e in effects if e["bucket"] == "REDFLAG"),
+                BUCKET_STABLE: sum(1 for e in effects if e["bucket"] == BUCKET_STABLE),
+                BUCKET_CONDITIONAL: sum(1 for e in effects if e["bucket"] == BUCKET_CONDITIONAL),
+                BUCKET_NON_EFFECT: sum(1 for e in effects if e["bucket"] == BUCKET_NON_EFFECT),
+                BUCKET_REDFLAG: sum(1 for e in effects if e["bucket"] == BUCKET_REDFLAG),
             },
             "n_models_used": len(run_subset),
         }
@@ -1201,16 +1223,16 @@ def run_stability_analysis(
         group_order = [str(g["group_key"]) for g in group_rows]
         group_meta = {str(g["group_key"]): g for g in group_rows}
     else:
-        group_order = sorted({str(r.get("group_key") or "__ALL__") for r in all_runs})
+        group_order = sorted({str(r.get("group_key") or ALL_GROUP_KEY) for r in all_runs})
         group_meta = {key: {"group_key": key, "group_values": {}, "n_rows_raw": 0, "n_rows_after_outlier": 0} for key in group_order}
 
     total_models_by_group: dict[str, int] = {}
     valid_models_by_group: dict[str, int] = {}
     for run in all_runs:
-        key = str(run.get("group_key") or "__ALL__")
+        key = str(run.get("group_key") or ALL_GROUP_KEY)
         total_models_by_group[key] = total_models_by_group.get(key, 0) + 1
     for run in selected:
-        key = str(run.get("group_key") or "__ALL__")
+        key = str(run.get("group_key") or ALL_GROUP_KEY)
         valid_models_by_group[key] = valid_models_by_group.get(key, 0) + 1
 
     row_counts = {key: int(group_meta.get(key, {}).get("n_rows_after_outlier", group_meta.get(key, {}).get("n_rows_raw", 0))) for key in group_order}
@@ -1233,7 +1255,7 @@ def run_stability_analysis(
     group_factor_panels: list[dict[str, Any]] = []
     per_group_effect_data: dict[str, dict[str, dict[str, Any]]] = {}
     for group_key in group_order:
-        runs_for_group = [r for r in selected if str(r.get("group_key") or "__ALL__") == group_key]
+        runs_for_group = [r for r in selected if str(r.get("group_key") or ALL_GROUP_KEY) == group_key]
         bundle = build_effect_bundle(runs_for_group, name_prefix=f"group:{group_key}")
         per_group_effect_data[group_key] = bundle["effect_data"]
         info = group_meta.get(group_key, {})
@@ -1262,10 +1284,10 @@ def run_stability_analysis(
                     "factor_name": factor,
                     "effect_count": len(factor_effects),
                     "bucket_counts": {
-                        "STABLE": sum(1 for e in factor_effects if e["bucket"] == "STABLE"),
-                        "CONDITIONAL": sum(1 for e in factor_effects if e["bucket"] == "CONDITIONAL"),
-                        "NON_EFFECT": sum(1 for e in factor_effects if e["bucket"] == "NON_EFFECT"),
-                        "REDFLAG": sum(1 for e in factor_effects if e["bucket"] == "REDFLAG"),
+                        BUCKET_STABLE: sum(1 for e in factor_effects if e["bucket"] == BUCKET_STABLE),
+                        BUCKET_CONDITIONAL: sum(1 for e in factor_effects if e["bucket"] == BUCKET_CONDITIONAL),
+                        BUCKET_NON_EFFECT: sum(1 for e in factor_effects if e["bucket"] == BUCKET_NON_EFFECT),
+                        BUCKET_REDFLAG: sum(1 for e in factor_effects if e["bucket"] == BUCKET_REDFLAG),
                     },
                     "effects": factor_effects,
                     "n_models_used": int(bundle["n_models_used"]),
@@ -1358,10 +1380,10 @@ def run_stability_analysis(
         "include_robust": include_robust,
         "selected_group_count": len(group_order),
         "bucket_counts": {
-            "STABLE": sum(1 for e in combined_effects if e["bucket"] == "STABLE"),
-            "CONDITIONAL": sum(1 for e in combined_effects if e["bucket"] == "CONDITIONAL"),
-            "NON_EFFECT": sum(1 for e in combined_effects if e["bucket"] == "NON_EFFECT"),
-            "REDFLAG": sum(1 for e in combined_effects if e["bucket"] == "REDFLAG"),
+            BUCKET_STABLE: sum(1 for e in combined_effects if e["bucket"] == BUCKET_STABLE),
+            BUCKET_CONDITIONAL: sum(1 for e in combined_effects if e["bucket"] == BUCKET_CONDITIONAL),
+            BUCKET_NON_EFFECT: sum(1 for e in combined_effects if e["bucket"] == BUCKET_NON_EFFECT),
+            BUCKET_REDFLAG: sum(1 for e in combined_effects if e["bucket"] == BUCKET_REDFLAG),
         },
         "group_weights": [
             {
@@ -1376,8 +1398,8 @@ def run_stability_analysis(
         ],
     }
     stratified = {
-        "ANOVA": {"n_models": sum(1 for r in selected if r.get("model_class") == "ANOVA")},
-        "ANCOVA": {"n_models": sum(1 for r in selected if r.get("model_class") == "ANCOVA")},
+        MODEL_CLASS_ANOVA: {"n_models": sum(1 for r in selected if r.get("model_class") == MODEL_CLASS_ANOVA)},
+        MODEL_CLASS_ANCOVA: {"n_models": sum(1 for r in selected if r.get("model_class") == MODEL_CLASS_ANCOVA)},
         "per_group": per_group,
         "group_factor_panels": group_factor_panels,
     }
@@ -1399,7 +1421,10 @@ def run_stability_analysis(
                 to_json(stratified),
             ],
         )
-        conn.execute("UPDATE analyses SET status = 'stability_complete', updated_at = ? WHERE id = ?", [utcnow_iso(), analysis_id])
+        conn.execute(
+            "UPDATE analyses SET status = ?, updated_at = ? WHERE id = ?",
+            [ANALYSIS_STATUS_STABILITY_COMPLETE, utcnow_iso(), analysis_id],
+        )
         conn.commit()
 
     return {"summary": summary, "effects": combined_effects, "stratified": stratified, "thresholds": thresholds}

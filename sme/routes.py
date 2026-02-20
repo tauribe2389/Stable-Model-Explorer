@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from flask import (
     Blueprint,
@@ -15,6 +15,18 @@ from flask import (
     url_for,
 )
 
+from .constants import (
+    ANALYSIS_STATUS_CONFIGURED,
+    ANALYSIS_STATUS_REGISTRY_GENERATED,
+    GROUP_MISSING_POLICY_AS_LEVEL,
+    GROUP_MISSING_POLICY_DROP_ROWS,
+    OUTLIER_DECISION_KEEP,
+    OUTLIER_DECISION_REMOVE,
+    VALIDITY_INVALID,
+    VALIDITY_VALID,
+    VALIDITY_VALID_WITH_ROBUST_SE,
+)
+from .contracts import AnalysisConfig, as_str_list, normalize_analysis_config, normalize_profile_rules
 from .db import fetchall, fetchone, from_json, get_conn, insert_and_get_id, to_json, utcnow_iso
 from .defaults import DEFAULT_ANALYSIS_CONFIG, DEFAULT_PROFILE_RULES
 from .modeling import (
@@ -36,7 +48,6 @@ from .profiling import (
     load_analysis_outliers,
     load_dataset_dataframe,
     load_dataset_metadata,
-    merged_rules,
     persist_analysis_groups,
     persist_outliers,
     reprofile_dataset,
@@ -48,34 +59,38 @@ from .reporting import create_report_snapshot
 bp = Blueprint("sme", __name__)
 
 
-def _db_path() -> str:
-    return current_app.config["DATABASE"]
-
-
-def _parse_int(name: str, default: int) -> int:
+def _parse_int(form: Mapping[str, Any], name: str, default: int) -> int:
     try:
-        return int(request.form.get(name, default))
+        return int(form.get(name, default))
     except Exception:
         return default
 
 
-def _parse_float(name: str, default: float) -> float:
+def _parse_float(form: Mapping[str, Any], name: str, default: float) -> float:
     try:
-        return float(request.form.get(name, default))
+        return float(form.get(name, default))
     except Exception:
         return default
 
 
-def _parse_bool(name: str, default: bool = False) -> bool:
-    if name not in request.form:
+def _parse_bool(form: Mapping[str, Any], name: str, default: bool = False) -> bool:
+    if name not in form:
         return default
-    return request.form.get(name) in {"1", "true", "True", "on", "yes"}
+    return form.get(name) in {"1", "true", "True", "on", "yes"}
 
 
 def _parse_csv_list(value: str) -> list[str]:
     if not value:
         return []
     return [x.strip() for x in value.split(",") if x.strip()]
+
+
+def _parse_list(form: Mapping[str, Any], name: str) -> list[str]:
+    getlist = getattr(form, "getlist", None)
+    if callable(getlist):
+        return [str(x).strip() for x in getlist(name) if str(x).strip()]
+    value = form.get(name, [])
+    return as_str_list(value)
 
 
 def _quote_ident(name: str) -> str:
@@ -98,10 +113,63 @@ def _friendly_ts(ts: str | None) -> str:
         return text
 
 
-def _safe_list(value: Any) -> list[str]:
-    if isinstance(value, list):
-        return [str(v) for v in value if str(v).strip()]
-    return []
+def _load_presets(db_path: str) -> list[dict[str, Any]]:
+    return [dict(r) for r in fetchall(db_path, "SELECT * FROM analysis_presets ORDER BY name")]
+
+
+def _load_analysis(db_path: str, analysis_id: int) -> dict[str, Any] | None:
+    row = fetchone(db_path, "SELECT * FROM analyses WHERE id = ?", [analysis_id])
+    return dict(row) if row else None
+
+
+def _analysis_or_home(db_path: str, analysis_id: int) -> dict[str, Any] | None:
+    analysis = _load_analysis(db_path, analysis_id)
+    if analysis is None:
+        flash("Analysis not found.", "error")
+    return analysis
+
+
+def _render_analysis_wizard(
+    db_path: str,
+    *,
+    dataset: dict[str, Any],
+    columns: list[dict[str, Any]],
+    config: dict[str, Any],
+    response_candidates: list[str],
+    categorical: list[str],
+    continuous: list[str],
+    preview: dict[str, Any] | None = None,
+):
+    return render_template(
+        "analysis_wizard.html",
+        dataset=dataset,
+        columns=columns,
+        config=config,
+        response_candidates=response_candidates,
+        categorical=categorical,
+        continuous=continuous,
+        presets=_load_presets(db_path),
+        preview=preview or {},
+    )
+
+
+def _resolve_artifact_path(raw_path: str, *, allowed_root: Path, not_found_message: str) -> Path | None:
+    if not raw_path:
+        flash("Missing file path.", "error")
+        return None
+    p = Path(raw_path)
+    try:
+        p = p.resolve()
+    except Exception:
+        flash("Invalid path.", "error")
+        return None
+    if allowed_root not in p.parents and p != allowed_root:
+        flash("Path not allowed.", "error")
+        return None
+    if not p.exists():
+        flash(not_found_message, "error")
+        return None
+    return p
 
 
 def _lineage_tag(combined_bucket: str | None, group_buckets: list[str]) -> tuple[str, str]:
@@ -299,47 +367,47 @@ def _health_label(name: str) -> str:
     return labels.get(name, name.replace("_", " ").title())
 
 
-def _build_config_from_form(existing: dict[str, Any] | None = None) -> dict[str, Any]:
-    cfg = dict(DEFAULT_ANALYSIS_CONFIG)
-    if existing:
-        cfg.update(existing)
+def _build_config_from_form(form: Mapping[str, Any], existing: Mapping[str, Any] | None = None) -> AnalysisConfig:
+    cfg: AnalysisConfig = normalize_analysis_config(existing, base=DEFAULT_ANALYSIS_CONFIG)
     cfg.update(
         {
-            "name": request.form.get("analysis_name", "").strip() or "SME Analysis",
-            "response": request.form.get("response", "").strip(),
-            "primary_factors": request.form.getlist("primary_factors"),
-            "group_variables": request.form.getlist("group_variables"),
-            "group_include_unobserved_combinations": _parse_bool("group_include_unobserved_combinations", False),
-            "group_missing_policy": request.form.get("group_missing_policy", cfg.get("group_missing_policy", "AS_LEVEL")).strip()
-            or "AS_LEVEL",
-            "group_max_groups_analyzed": _parse_int("group_max_groups_analyzed", cfg.get("group_max_groups_analyzed", 25)),
-            "group_min_primary_level_n": _parse_int("group_min_primary_level_n", cfg.get("group_min_primary_level_n", 5)),
-            "categorical_covariates": request.form.getlist("categorical_covariates"),
-            "continuous_covariates": request.form.getlist("continuous_covariates"),
-            "forced_terms": request.form.getlist("forced_terms"),
-            "interaction_candidates": _parse_csv_list(request.form.get("interaction_candidates", "")),
-            "max_covariates_in_model": _parse_int("max_covariates_in_model", cfg["max_covariates_in_model"]),
-            "max_interactions_in_model": _parse_int("max_interactions_in_model", cfg["max_interactions_in_model"]),
-            "max_total_models": _parse_int("max_total_models", cfg["max_total_models"]),
-            "random_seed": _parse_int("random_seed", cfg["random_seed"]),
-            "robust_se_mode": request.form.get("robust_se_mode", cfg["robust_se_mode"]).strip() or "HC3",
-            "include_robust_in_stability": _parse_bool("include_robust_in_stability", True),
-            "vif_fail_threshold": _parse_float("vif_fail_threshold", cfg["vif_fail_threshold"]),
-            "vif_warn_threshold": _parse_float("vif_warn_threshold", cfg["vif_warn_threshold"]),
-            "bp_alpha": _parse_float("bp_alpha", cfg["bp_alpha"]),
-            "shapiro_fail_alpha": _parse_float("shapiro_fail_alpha", cfg["shapiro_fail_alpha"]),
-            "shapiro_warn_alpha": _parse_float("shapiro_warn_alpha", cfg["shapiro_warn_alpha"]),
-            "cook_threshold_multiplier": _parse_float("cook_threshold_multiplier", cfg["cook_threshold_multiplier"]),
-            "cook_fail": _parse_bool("cook_fail", False),
-            "outlier_mad_threshold": _parse_float("outlier_mad_threshold", cfg["outlier_mad_threshold"]),
-            "stable_sign_pct": _parse_float("stable_sign_pct", cfg["stable_sign_pct"]),
-            "stable_practical_pct": _parse_float("stable_practical_pct", cfg["stable_practical_pct"]),
-            "non_effect_pct": _parse_float("non_effect_pct", cfg["non_effect_pct"]),
-            "engineering_delta": _parse_float("engineering_delta", cfg["engineering_delta"]),
-            "equivalence_bound": _parse_float("equivalence_bound", cfg["equivalence_bound"]),
-            "sign_flip_redflag_pct": _parse_float("sign_flip_redflag_pct", cfg["sign_flip_redflag_pct"]),
-            "health_min_rows": _parse_int("health_min_rows", cfg["health_min_rows"]),
-            "health_min_rows_per_group": _parse_int("health_min_rows_per_group", cfg["health_min_rows_per_group"]),
+            "name": str(form.get("analysis_name", "")).strip() or "SME Analysis",
+            "response": str(form.get("response", "")).strip(),
+            "primary_factors": _parse_list(form, "primary_factors"),
+            "group_variables": _parse_list(form, "group_variables"),
+            "group_include_unobserved_combinations": _parse_bool(form, "group_include_unobserved_combinations", False),
+            "group_missing_policy": str(
+                form.get("group_missing_policy", cfg.get("group_missing_policy", GROUP_MISSING_POLICY_AS_LEVEL))
+            ).strip()
+            or GROUP_MISSING_POLICY_AS_LEVEL,
+            "group_max_groups_analyzed": _parse_int(form, "group_max_groups_analyzed", cfg.get("group_max_groups_analyzed", 25)),
+            "group_min_primary_level_n": _parse_int(form, "group_min_primary_level_n", cfg.get("group_min_primary_level_n", 5)),
+            "categorical_covariates": _parse_list(form, "categorical_covariates"),
+            "continuous_covariates": _parse_list(form, "continuous_covariates"),
+            "forced_terms": _parse_list(form, "forced_terms"),
+            "interaction_candidates": _parse_csv_list(str(form.get("interaction_candidates", ""))),
+            "max_covariates_in_model": _parse_int(form, "max_covariates_in_model", cfg["max_covariates_in_model"]),
+            "max_interactions_in_model": _parse_int(form, "max_interactions_in_model", cfg["max_interactions_in_model"]),
+            "max_total_models": _parse_int(form, "max_total_models", cfg["max_total_models"]),
+            "random_seed": _parse_int(form, "random_seed", cfg["random_seed"]),
+            "robust_se_mode": str(form.get("robust_se_mode", cfg["robust_se_mode"])).strip() or "HC3",
+            "include_robust_in_stability": _parse_bool(form, "include_robust_in_stability", True),
+            "vif_fail_threshold": _parse_float(form, "vif_fail_threshold", cfg["vif_fail_threshold"]),
+            "vif_warn_threshold": _parse_float(form, "vif_warn_threshold", cfg["vif_warn_threshold"]),
+            "bp_alpha": _parse_float(form, "bp_alpha", cfg["bp_alpha"]),
+            "shapiro_fail_alpha": _parse_float(form, "shapiro_fail_alpha", cfg["shapiro_fail_alpha"]),
+            "shapiro_warn_alpha": _parse_float(form, "shapiro_warn_alpha", cfg["shapiro_warn_alpha"]),
+            "cook_threshold_multiplier": _parse_float(form, "cook_threshold_multiplier", cfg["cook_threshold_multiplier"]),
+            "cook_fail": _parse_bool(form, "cook_fail", False),
+            "outlier_mad_threshold": _parse_float(form, "outlier_mad_threshold", cfg["outlier_mad_threshold"]),
+            "stable_sign_pct": _parse_float(form, "stable_sign_pct", cfg["stable_sign_pct"]),
+            "stable_practical_pct": _parse_float(form, "stable_practical_pct", cfg["stable_practical_pct"]),
+            "non_effect_pct": _parse_float(form, "non_effect_pct", cfg["non_effect_pct"]),
+            "engineering_delta": _parse_float(form, "engineering_delta", cfg["engineering_delta"]),
+            "equivalence_bound": _parse_float(form, "equivalence_bound", cfg["equivalence_bound"]),
+            "sign_flip_redflag_pct": _parse_float(form, "sign_flip_redflag_pct", cfg["sign_flip_redflag_pct"]),
+            "health_min_rows": _parse_int(form, "health_min_rows", cfg["health_min_rows"]),
+            "health_min_rows_per_group": _parse_int(form, "health_min_rows_per_group", cfg["health_min_rows_per_group"]),
         }
     )
     list_fields = [
@@ -353,9 +421,9 @@ def _build_config_from_form(existing: dict[str, Any] | None = None) -> dict[str,
     for field in list_fields:
         cfg[field] = list(dict.fromkeys(cfg.get(field, [])))
 
-    cfg["group_missing_policy"] = str(cfg.get("group_missing_policy", "AS_LEVEL")).upper()
-    if cfg["group_missing_policy"] not in {"AS_LEVEL", "DROP_ROWS"}:
-        cfg["group_missing_policy"] = "AS_LEVEL"
+    cfg["group_missing_policy"] = str(cfg.get("group_missing_policy", GROUP_MISSING_POLICY_AS_LEVEL)).upper()
+    if cfg["group_missing_policy"] not in {GROUP_MISSING_POLICY_AS_LEVEL, GROUP_MISSING_POLICY_DROP_ROWS}:
+        cfg["group_missing_policy"] = GROUP_MISSING_POLICY_AS_LEVEL
     cfg["group_max_groups_analyzed"] = max(1, int(cfg.get("group_max_groups_analyzed", 25)))
     cfg["group_min_primary_level_n"] = max(1, int(cfg.get("group_min_primary_level_n", 5)))
 
@@ -374,12 +442,12 @@ def _build_config_from_form(existing: dict[str, Any] | None = None) -> dict[str,
         if len([p.strip() for p in x.split(":") if p.strip()]) == 2
         and all(p.strip() not in set(group_vars) for p in x.split(":"))
     ]
-    return cfg
+    return normalize_analysis_config(cfg)
 
 
 @bp.route("/")
 def home():
-    db_path = _db_path()
+    db_path = current_app.config["DATABASE"]
     datasets = [dict(r) for r in fetchall(db_path, "SELECT * FROM datasets ORDER BY COALESCE(updated_at, uploaded_at) DESC")]
     analyses = [
         dict(r)
@@ -399,13 +467,14 @@ def home():
     for a in analyses:
         a["created_at_friendly"] = _friendly_ts(a.get("created_at"))
         a["updated_at_friendly"] = _friendly_ts(a.get("updated_at"))
-    presets = [dict(r) for r in fetchall(db_path, "SELECT * FROM analysis_presets ORDER BY name")]
+    presets = _load_presets(db_path)
     return render_template("home.html", datasets=datasets, analyses=analyses, presets=presets)
 
 
 @bp.route("/upload", methods=["POST"])
 def upload():
-    db_path = _db_path()
+    db_path = current_app.config["DATABASE"]
+    form = request.form
     file = request.files.get("dataset_csv")
     if not file or not file.filename:
         flash("CSV file is required.", "error")
@@ -420,13 +489,13 @@ def upload():
     saved_path = upload_dir / file.filename
     file.save(saved_path)
 
-    rules = merged_rules(
+    rules = normalize_profile_rules(
         {
-            "categorical_max_cardinality": _parse_int("categorical_max_cardinality", DEFAULT_PROFILE_RULES["categorical_max_cardinality"]),
+            "categorical_max_cardinality": _parse_int(form, "categorical_max_cardinality", DEFAULT_PROFILE_RULES["categorical_max_cardinality"]),
             "datetime_categorical_max_cardinality": _parse_int(
-                "datetime_categorical_max_cardinality", DEFAULT_PROFILE_RULES["datetime_categorical_max_cardinality"]
+                form, "datetime_categorical_max_cardinality", DEFAULT_PROFILE_RULES["datetime_categorical_max_cardinality"]
             ),
-            "text_unique_ratio_exclude": _parse_float("text_unique_ratio_exclude", DEFAULT_PROFILE_RULES["text_unique_ratio_exclude"]),
+            "text_unique_ratio_exclude": _parse_float(form, "text_unique_ratio_exclude", DEFAULT_PROFILE_RULES["text_unique_ratio_exclude"]),
         }
     )
     try:
@@ -440,7 +509,7 @@ def upload():
 
 @bp.route("/dataset/<int:dataset_id>")
 def dataset_detail(dataset_id: int):
-    db_path = _db_path()
+    db_path = current_app.config["DATABASE"]
     meta = load_dataset_metadata(db_path, dataset_id)
     dataset = meta["dataset"]
     columns = meta["columns"]
@@ -453,7 +522,7 @@ def dataset_detail(dataset_id: int):
         "missing_columns_count": sum(1 for c in columns if int(c.get("missing_count", 0)) > 0),
     }
     dataset["schema"] = from_json(dataset["schema_json"], [])
-    dataset["profile_rules"] = from_json(dataset["profile_rules_json"], DEFAULT_PROFILE_RULES)
+    dataset["profile_rules"] = normalize_profile_rules(from_json(dataset["profile_rules_json"], DEFAULT_PROFILE_RULES))
     dataset["uploaded_at_friendly"] = _friendly_ts(dataset.get("uploaded_at"))
     dataset["updated_at_friendly"] = _friendly_ts(dataset.get("updated_at"))
     return render_template("dataset_detail.html", dataset=dataset, columns=columns, profile_summary=profile_summary)
@@ -461,14 +530,15 @@ def dataset_detail(dataset_id: int):
 
 @bp.route("/dataset/<int:dataset_id>/reprofile", methods=["POST"])
 def reprofile(dataset_id: int):
-    db_path = _db_path()
-    rules = merged_rules(
+    db_path = current_app.config["DATABASE"]
+    form = request.form
+    rules = normalize_profile_rules(
         {
-            "categorical_max_cardinality": _parse_int("categorical_max_cardinality", DEFAULT_PROFILE_RULES["categorical_max_cardinality"]),
+            "categorical_max_cardinality": _parse_int(form, "categorical_max_cardinality", DEFAULT_PROFILE_RULES["categorical_max_cardinality"]),
             "datetime_categorical_max_cardinality": _parse_int(
-                "datetime_categorical_max_cardinality", DEFAULT_PROFILE_RULES["datetime_categorical_max_cardinality"]
+                form, "datetime_categorical_max_cardinality", DEFAULT_PROFILE_RULES["datetime_categorical_max_cardinality"]
             ),
-            "text_unique_ratio_exclude": _parse_float("text_unique_ratio_exclude", DEFAULT_PROFILE_RULES["text_unique_ratio_exclude"]),
+            "text_unique_ratio_exclude": _parse_float(form, "text_unique_ratio_exclude", DEFAULT_PROFILE_RULES["text_unique_ratio_exclude"]),
         }
     )
     try:
@@ -481,7 +551,7 @@ def reprofile(dataset_id: int):
 
 @bp.route("/dataset/<int:dataset_id>/roles", methods=["POST"])
 def update_dataset_roles(dataset_id: int):
-    db_path = _db_path()
+    db_path = current_app.config["DATABASE"]
     meta = load_dataset_metadata(db_path, dataset_id)
     columns = meta["columns"]
     role_updates: dict[int, str] = {}
@@ -498,7 +568,7 @@ def update_dataset_roles(dataset_id: int):
 
 @bp.route("/dataset/<int:dataset_id>/column-preview")
 def dataset_column_preview(dataset_id: int):
-    db_path = _db_path()
+    db_path = current_app.config["DATABASE"]
     column_name = request.args.get("column_name", "").strip()
     if not column_name:
         flash("Choose a column to preview.", "error")
@@ -528,7 +598,7 @@ def dataset_column_preview(dataset_id: int):
         row_count = int(dataset.get("row_count", 0))
         non_null = int(preview.get("non_null_count", 0))
         allowed_roles = allowed_roles_for_inferred_type(detected)
-        profile_rules = from_json(dataset.get("profile_rules_json"), DEFAULT_PROFILE_RULES)
+        profile_rules = normalize_profile_rules(from_json(dataset.get("profile_rules_json"), DEFAULT_PROFILE_RULES))
         cat_limit = int(profile_rules.get("categorical_max_cardinality", DEFAULT_PROFILE_RULES["categorical_max_cardinality"]))
 
         if role == "categorical":
@@ -584,7 +654,7 @@ def dataset_column_preview(dataset_id: int):
 
 @bp.route("/dataset/<int:dataset_id>/column-preview/role", methods=["POST"])
 def dataset_column_preview_update_role(dataset_id: int):
-    db_path = _db_path()
+    db_path = current_app.config["DATABASE"]
     column_name = request.form.get("column_name", "").strip()
     if not column_name:
         flash("Missing column name.", "error")
@@ -609,7 +679,7 @@ def dataset_column_preview_update_role(dataset_id: int):
 
 @bp.route("/dataset/<int:dataset_id>/delete", methods=["POST"])
 def delete_dataset(dataset_id: int):
-    db_path = _db_path()
+    db_path = current_app.config["DATABASE"]
     row = fetchone(db_path, "SELECT id, name, data_table_name FROM datasets WHERE id = ?", [dataset_id])
     if not row:
         flash("Dataset not found.", "error")
@@ -629,12 +699,10 @@ def delete_dataset(dataset_id: int):
 
 @bp.route("/analysis/<int:analysis_id>/delete", methods=["POST"])
 def delete_analysis(analysis_id: int):
-    db_path = _db_path()
-    row = fetchone(db_path, "SELECT id, name FROM analyses WHERE id = ?", [analysis_id])
-    if not row:
-        flash("Analysis not found.", "error")
+    db_path = current_app.config["DATABASE"]
+    analysis = _analysis_or_home(db_path, analysis_id)
+    if analysis is None:
         return redirect(url_for("sme.home"))
-    analysis = dict(row)
     try:
         with get_conn(db_path) as conn:
             conn.execute("DELETE FROM analyses WHERE id = ?", [analysis_id])
@@ -647,7 +715,7 @@ def delete_analysis(analysis_id: int):
 
 @bp.route("/analysis/new/<int:dataset_id>", methods=["GET", "POST"])
 def analysis_new(dataset_id: int):
-    db_path = _db_path()
+    db_path = current_app.config["DATABASE"]
     meta = load_dataset_metadata(db_path, dataset_id)
     dataset = meta["dataset"]
     columns = meta["columns"]
@@ -655,27 +723,26 @@ def analysis_new(dataset_id: int):
     categorical = [c["column_name"] for c in columns if c["model_role"] == "categorical"]
     continuous = [c["column_name"] for c in columns if c["model_role"] == "continuous"]
 
-    selected_config = dict(DEFAULT_ANALYSIS_CONFIG)
+    selected_config = normalize_analysis_config(DEFAULT_ANALYSIS_CONFIG)
     preset_id = request.args.get("preset_id")
     if preset_id:
         preset = fetchone(db_path, "SELECT * FROM analysis_presets WHERE id = ?", [preset_id])
         if preset:
-            selected_config.update(from_json(preset["config_json"], {}))
+            selected_config = normalize_analysis_config(from_json(preset["config_json"], {}), base=selected_config)
 
     if request.method == "POST":
-        selected_config = _build_config_from_form(selected_config)
+        selected_config = _build_config_from_form(request.form, selected_config)
         response = selected_config["response"]
         if response not in response_candidates:
             flash("Select a valid response variable.", "error")
-            return render_template(
-                "analysis_wizard.html",
+            return _render_analysis_wizard(
+                db_path,
                 dataset=dataset,
                 columns=columns,
                 config=selected_config,
                 response_candidates=response_candidates,
                 categorical=categorical,
                 continuous=continuous,
-                presets=[dict(r) for r in fetchall(db_path, "SELECT * FROM analysis_presets ORDER BY name")],
                 preview={},
             )
 
@@ -701,15 +768,14 @@ def analysis_new(dataset_id: int):
         existing_analysis = fetchone(db_path, "SELECT id FROM analyses WHERE LOWER(name) = LOWER(?)", [analysis_name])
         if existing_analysis:
             flash(f'Analysis name "{analysis_name}" already exists. Use a unique name.', "error")
-            return render_template(
-                "analysis_wizard.html",
+            return _render_analysis_wizard(
+                db_path,
                 dataset=dataset,
                 columns=columns,
                 config=selected_config,
                 response_candidates=response_candidates,
                 categorical=categorical,
                 continuous=continuous,
-                presets=[dict(r) for r in fetchall(db_path, "SELECT * FROM analysis_presets ORDER BY name")],
                 preview={},
             )
 
@@ -723,7 +789,7 @@ def analysis_new(dataset_id: int):
             min_primary_level_n=int(selected_config.get("group_min_primary_level_n", 5)),
             max_groups_analyzed=int(selected_config.get("group_max_groups_analyzed", 25)),
             include_unobserved=bool(selected_config.get("group_include_unobserved_combinations", False)),
-            missing_policy=str(selected_config.get("group_missing_policy", "AS_LEVEL")),
+            missing_policy=str(selected_config.get("group_missing_policy", GROUP_MISSING_POLICY_AS_LEVEL)),
         )
         screening = build_screening_bundle(df, columns, selected_config)
         health = compute_health_checks(
@@ -746,7 +812,7 @@ def analysis_new(dataset_id: int):
                 analysis_name,
                 utcnow_iso(),
                 utcnow_iso(),
-                "configured",
+                ANALYSIS_STATUS_CONFIGURED,
                 to_json(selected_config),
                 to_json(screening),
                 to_json(health),
@@ -777,7 +843,10 @@ def analysis_new(dataset_id: int):
             group_keys=group_manifest.get("summary", {}).get("selected_group_keys", []),
         )
         with get_conn(db_path) as conn:
-            conn.execute("UPDATE analyses SET status = 'registry_generated', updated_at = ? WHERE id = ?", [utcnow_iso(), analysis_id])
+            conn.execute(
+                "UPDATE analyses SET status = ?, updated_at = ? WHERE id = ?",
+                [ANALYSIS_STATUS_REGISTRY_GENERATED, utcnow_iso(), analysis_id],
+            )
             conn.commit()
         summary = group_manifest.get("summary", {})
         flash(
@@ -794,35 +863,32 @@ def analysis_new(dataset_id: int):
     preview = {}
     if response_candidates:
         preview["suggested_response"] = response_candidates[0]
-    return render_template(
-        "analysis_wizard.html",
+    return _render_analysis_wizard(
+        db_path,
         dataset=dataset,
         columns=columns,
         config=selected_config,
         response_candidates=response_candidates,
         categorical=categorical,
         continuous=continuous,
-        presets=[dict(r) for r in fetchall(db_path, "SELECT * FROM analysis_presets ORDER BY name")],
         preview=preview,
     )
 
 
 @bp.route("/analysis/<int:analysis_id>/outliers", methods=["GET", "POST"])
 def outlier_review(analysis_id: int):
-    db_path = _db_path()
-    analysis_row = fetchone(db_path, "SELECT * FROM analyses WHERE id = ?", [analysis_id])
-    if not analysis_row:
-        flash("Analysis not found.", "error")
+    db_path = current_app.config["DATABASE"]
+    analysis = _analysis_or_home(db_path, analysis_id)
+    if analysis is None:
         return redirect(url_for("sme.home"))
-    analysis = dict(analysis_row)
     if request.method == "POST":
         outliers = load_analysis_outliers(db_path, analysis_id)
         decisions = {}
         for o in outliers:
             key = f'decision_{o["row_index"]}'
-            decision = request.form.get(key, "keep")
-            if decision not in {"keep", "remove"}:
-                decision = "keep"
+            decision = request.form.get(key, OUTLIER_DECISION_KEEP)
+            if decision not in {OUTLIER_DECISION_KEEP, OUTLIER_DECISION_REMOVE}:
+                decision = OUTLIER_DECISION_KEEP
             decisions[int(o["row_index"])] = decision
         update_outlier_decisions(db_path, analysis_id, decisions)
         with get_conn(db_path) as conn:
@@ -840,26 +906,22 @@ def outlier_review(analysis_id: int):
 
 @bp.route("/analysis/<int:analysis_id>/registry")
 def model_registry(analysis_id: int):
-    db_path = _db_path()
-    analysis_row = fetchone(db_path, "SELECT * FROM analyses WHERE id = ?", [analysis_id])
-    if not analysis_row:
-        flash("Analysis not found.", "error")
+    db_path = current_app.config["DATABASE"]
+    analysis = _analysis_or_home(db_path, analysis_id)
+    if analysis is None:
         return redirect(url_for("sme.home"))
-    analysis = dict(analysis_row)
-    config = from_json(analysis["config_json"], {})
+    config = normalize_analysis_config(from_json(analysis["config_json"], {}))
     registry = load_registry(db_path, analysis_id)
     return render_template("model_registry.html", analysis=analysis, config=config, registry=registry)
 
 
 @bp.route("/analysis/<int:analysis_id>/run", methods=["GET", "POST"])
 def run_models(analysis_id: int):
-    db_path = _db_path()
-    analysis_row = fetchone(db_path, "SELECT * FROM analyses WHERE id = ?", [analysis_id])
-    if not analysis_row:
-        flash("Analysis not found.", "error")
+    db_path = current_app.config["DATABASE"]
+    analysis = _analysis_or_home(db_path, analysis_id)
+    if analysis is None:
         return redirect(url_for("sme.home"))
-    analysis = dict(analysis_row)
-    config = from_json(analysis["config_json"], {})
+    config = normalize_analysis_config(from_json(analysis["config_json"], {}))
     dataset_id = int(analysis["dataset_id"])
     columns = load_dataset_metadata(db_path, dataset_id)["columns"]
 
@@ -880,12 +942,10 @@ def run_models(analysis_id: int):
 
 @bp.route("/analysis/<int:analysis_id>/runs")
 def model_runs_summary(analysis_id: int):
-    db_path = _db_path()
-    analysis_row = fetchone(db_path, "SELECT * FROM analyses WHERE id = ?", [analysis_id])
-    if not analysis_row:
-        flash("Analysis not found.", "error")
+    db_path = current_app.config["DATABASE"]
+    analysis = _analysis_or_home(db_path, analysis_id)
+    if analysis is None:
         return redirect(url_for("sme.home"))
-    analysis = dict(analysis_row)
     all_runs = list_model_runs(db_path, analysis_id)
     runs = list(all_runs)
     validity_filter = request.args.get("validity", "").strip()
@@ -893,27 +953,25 @@ def model_runs_summary(analysis_id: int):
         runs = [r for r in runs if r["validity_class"] == validity_filter]
     counts = {
         "total": len(all_runs),
-        "valid": sum(1 for r in all_runs if r["validity_class"] == "valid"),
-        "invalid": sum(1 for r in all_runs if r["validity_class"] == "invalid"),
-        "valid_with_robust_se": sum(1 for r in all_runs if r["validity_class"] == "valid_with_robust_se"),
+        "valid": sum(1 for r in all_runs if r["validity_class"] == VALIDITY_VALID),
+        "invalid": sum(1 for r in all_runs if r["validity_class"] == VALIDITY_INVALID),
+        "valid_with_robust_se": sum(1 for r in all_runs if r["validity_class"] == VALIDITY_VALID_WITH_ROBUST_SE),
     }
     return render_template("model_runs_summary.html", analysis=analysis, runs=runs, counts=counts, validity_filter=validity_filter)
 
 
 @bp.route("/analysis/<int:analysis_id>/stability", methods=["GET", "POST"])
 def stability_dashboard(analysis_id: int):
-    db_path = _db_path()
-    analysis_row = fetchone(db_path, "SELECT * FROM analyses WHERE id = ?", [analysis_id])
-    if not analysis_row:
-        flash("Analysis not found.", "error")
+    db_path = current_app.config["DATABASE"]
+    analysis = _analysis_or_home(db_path, analysis_id)
+    if analysis is None:
         return redirect(url_for("sme.home"))
-    analysis = dict(analysis_row)
-    config = from_json(analysis["config_json"], {})
+    config = normalize_analysis_config(from_json(analysis["config_json"], {}))
     health = from_json(analysis.get("health_json"), {}) if analysis.get("health_json") else {}
     group_summary = health.get("group_summary", {}) if isinstance(health, dict) else {}
 
     if request.method == "POST":
-        include_robust = _parse_bool("include_robust", bool(config.get("include_robust_in_stability", True)))
+        include_robust = _parse_bool(request.form, "include_robust", bool(config.get("include_robust_in_stability", True)))
         try:
             run_stability_analysis(
                 db_path,
@@ -941,12 +999,10 @@ def stability_dashboard(analysis_id: int):
 
 @bp.route("/analysis/<int:analysis_id>/report", methods=["GET", "POST"])
 def report_export(analysis_id: int):
-    db_path = _db_path()
-    analysis_row = fetchone(db_path, "SELECT * FROM analyses WHERE id = ?", [analysis_id])
-    if not analysis_row:
-        flash("Analysis not found.", "error")
+    db_path = current_app.config["DATABASE"]
+    analysis = _analysis_or_home(db_path, analysis_id)
+    if analysis is None:
         return redirect(url_for("sme.home"))
-    analysis = dict(analysis_row)
 
     if request.method == "POST":
         try:
@@ -962,31 +1018,28 @@ def report_export(analysis_id: int):
 
 @bp.route("/analysis/<int:analysis_id>")
 def analysis_overview(analysis_id: int):
-    db_path = _db_path()
-    analysis_row = fetchone(db_path, "SELECT * FROM analyses WHERE id = ?", [analysis_id])
-    if not analysis_row:
-        flash("Analysis not found.", "error")
+    db_path = current_app.config["DATABASE"]
+    analysis = _analysis_or_home(db_path, analysis_id)
+    if analysis is None:
         return redirect(url_for("sme.home"))
-    analysis = dict(analysis_row)
     dataset_row = fetchone(db_path, "SELECT id, name FROM datasets WHERE id = ?", [analysis["dataset_id"]])
     dataset = dict(dataset_row) if dataset_row else {"id": analysis["dataset_id"], "name": f"Dataset {analysis['dataset_id']}"}
-    config = from_json(analysis["config_json"], {})
-    screening = from_json(analysis.get("screening_json"), {})
+    config = normalize_analysis_config(from_json(analysis["config_json"], {}))
     health = from_json(analysis.get("health_json"), {})
     config_summary = {
         "response": str(config.get("response", "")),
-        "primary_factors": _safe_list(config.get("primary_factors")),
-        "group_variables": _safe_list(config.get("group_variables")),
+        "primary_factors": as_str_list(config.get("primary_factors")),
+        "group_variables": as_str_list(config.get("group_variables")),
         "group_settings": {
-            "missing_policy": str(config.get("group_missing_policy", "AS_LEVEL")),
+            "missing_policy": str(config.get("group_missing_policy", GROUP_MISSING_POLICY_AS_LEVEL)),
             "include_unobserved": bool(config.get("group_include_unobserved_combinations", False)),
             "max_groups_analyzed": int(config.get("group_max_groups_analyzed", 25)),
             "min_primary_level_n": int(config.get("group_min_primary_level_n", 5)),
         },
-        "categorical_covariates": _safe_list(config.get("categorical_covariates")),
-        "continuous_covariates": _safe_list(config.get("continuous_covariates")),
-        "forced_terms": _safe_list(config.get("forced_terms")),
-        "interaction_candidates": _safe_list(config.get("interaction_candidates")),
+        "categorical_covariates": as_str_list(config.get("categorical_covariates")),
+        "continuous_covariates": as_str_list(config.get("continuous_covariates")),
+        "forced_terms": as_str_list(config.get("forced_terms")),
+        "interaction_candidates": as_str_list(config.get("interaction_candidates")),
         "model_caps": {
             "max_covariates_in_model": int(config.get("max_covariates_in_model", 0)),
             "max_interactions_in_model": int(config.get("max_interactions_in_model", 0)),
@@ -1010,17 +1063,6 @@ def analysis_overview(analysis_id: int):
         "all_passed": bool(health.get("all_passed", False)),
         "rows": int(health.get("rows", 0)) if isinstance(health, dict) else 0,
     }
-    univariate = screening.get("univariate", {}) if isinstance(screening, dict) else {}
-    confounding = screening.get("confounding", {}) if isinstance(screening, dict) else {}
-    collinearity = screening.get("collinearity", {}) if isinstance(screening, dict) else {}
-    screening_digest = {
-        "likely_primary_factors": univariate.get("likely_primary_factors", []),
-        "likely_important_covariates": univariate.get("likely_important_covariates", []),
-        "categorical_univariate": univariate.get("categorical_univariate", [])[:12],
-        "continuous_univariate": univariate.get("continuous_univariate", [])[:12],
-        "suspicious_confounders": confounding.get("suspicious_confounders", [])[:20],
-        "collinearity_clusters": collinearity.get("clusters", []),
-    }
     return render_template(
         "analysis_overview.html",
         analysis=analysis,
@@ -1028,49 +1070,28 @@ def analysis_overview(analysis_id: int):
         config_summary=config_summary,
         health_flags=health_flags,
         health_summary=health_summary,
-        screening_digest=screening_digest,
     )
 
 
 @bp.route("/download")
 def download_file():
-    raw_path = request.args.get("path", "")
-    if not raw_path:
-        flash("Missing file path.", "error")
-        return redirect(url_for("sme.home"))
-    p = Path(raw_path)
-    try:
-        p = p.resolve()
-    except Exception:
-        flash("Invalid path.", "error")
-        return redirect(url_for("sme.home"))
-    allowed_root = Path(current_app.config["ARTIFACT_DIR"]).resolve()
-    if allowed_root not in p.parents and p != allowed_root:
-        flash("Path not allowed.", "error")
-        return redirect(url_for("sme.home"))
-    if not p.exists():
-        flash("File not found.", "error")
+    p = _resolve_artifact_path(
+        request.args.get("path", ""),
+        allowed_root=Path(current_app.config["ARTIFACT_DIR"]).resolve(),
+        not_found_message="File not found.",
+    )
+    if p is None:
         return redirect(url_for("sme.home"))
     return send_file(p, as_attachment=True)
 
 
 @bp.route("/artifact")
 def view_artifact():
-    raw_path = request.args.get("path", "")
-    if not raw_path:
-        flash("Missing file path.", "error")
-        return redirect(url_for("sme.home"))
-    p = Path(raw_path)
-    try:
-        p = p.resolve()
-    except Exception:
-        flash("Invalid path.", "error")
-        return redirect(url_for("sme.home"))
-    allowed_root = Path(current_app.config["ARTIFACT_DIR"]).resolve()
-    if allowed_root not in p.parents and p != allowed_root:
-        flash("Path not allowed.", "error")
-        return redirect(url_for("sme.home"))
-    if not p.exists():
-        flash("Artifact not found.", "error")
+    p = _resolve_artifact_path(
+        request.args.get("path", ""),
+        allowed_root=Path(current_app.config["ARTIFACT_DIR"]).resolve(),
+        not_found_message="Artifact not found.",
+    )
+    if p is None:
         return redirect(url_for("sme.home"))
     return send_file(p, as_attachment=False)
