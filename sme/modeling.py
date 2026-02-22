@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import hashlib
+import os
 import random
 from pathlib import Path
 from typing import Any
@@ -286,7 +287,8 @@ def _save_diagnostic_plots(
     model_idx: int,
     fit,
 ) -> dict[str, str]:
-    out_dir = Path(artifact_dir) / "plots" / f"analysis_{analysis_id}"
+    root = Path(artifact_dir).expanduser().resolve(strict=False)
+    out_dir = root / "plots" / f"analysis_{analysis_id}"
     out_dir.mkdir(parents=True, exist_ok=True)
     resid_path = out_dir / f"model_{model_idx}_resid_vs_fit.png"
     qq_path = out_dir / f"model_{model_idx}_qq.png"
@@ -795,15 +797,94 @@ def _safe_slug(text: str, max_len: int = 80) -> str:
     if not clean:
         clean = "effect"
     digest = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:10]
-    head_len = max(8, max_len - len(digest) - 1)
+    if max_len <= 0:
+        return digest
+    min_total = len(digest) + 2  # at least "x_<digest>"
+    if max_len < min_total:
+        return digest[:max_len]
+    head_len = max(1, max_len - len(digest) - 1)
     clean = clean[:head_len]
     return f"{clean}_{digest}"
 
 
 def _stability_plot_dir(artifact_dir: str, analysis_id: int) -> Path:
-    out_dir = Path(artifact_dir) / "plots" / f"analysis_{analysis_id}" / "stability"
+    root = Path(artifact_dir).expanduser().resolve(strict=False)
+    out_dir = root / "plots" / f"analysis_{analysis_id}" / "stability"
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
+
+
+def _plot_slug_budget(out_dir: Path, suffix: str, default: int = 52) -> int:
+    # Keep full path below conservative Windows legacy MAX_PATH thresholds.
+    if os.name != "nt":
+        return default
+    base = str(out_dir.resolve(strict=False))
+    max_path_target = 235
+    available = max_path_target - len(base) - 1 - len(suffix)
+    return max(10, min(default, available))
+
+
+def _is_path_save_error(exc: Exception) -> bool:
+    if isinstance(exc, FileNotFoundError):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    if getattr(exc, "winerror", None) in {2, 3, 206, 123}:
+        return True
+    if getattr(exc, "errno", None) in {2, 22, 36, 63}:
+        return True
+    msg = str(exc).lower()
+    return ("path" in msg and ("not found" in msg or "too long" in msg)) or ("filename or extension is too long" in msg)
+
+
+def _save_plot_with_fallback(fig, out_dir: Path, slug_source: str, suffix: str) -> str | None:
+    slug_lengths = [_plot_slug_budget(out_dir, suffix), 28, 16]
+    seen: set[str] = set()
+    for slug_len in slug_lengths:
+        slug = _safe_slug(slug_source, max_len=slug_len)
+        if slug in seen:
+            continue
+        seen.add(slug)
+        path = out_dir / f"{slug}{suffix}"
+        try:
+            fig.savefig(path)
+            return str(path)
+        except Exception as exc:
+            if not _is_path_save_error(exc):
+                raise
+            continue
+    return None
+
+
+def _plot_hist_safe(ax, arr: np.ndarray, preferred_bins: int, **hist_kwargs) -> None:
+    values = np.asarray(arr, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return
+
+    unique_count = int(np.unique(values).size)
+    bins = max(1, min(int(preferred_bins), unique_count if unique_count > 0 else 1))
+    left = float(np.min(values))
+    right = float(np.max(values))
+    range_arg: tuple[float, float] | None
+    if np.isfinite(left) and np.isfinite(right):
+        if right <= left:
+            right = float(np.nextafter(left, np.inf))
+        range_arg = (left, right)
+    else:
+        range_arg = None
+
+    try:
+        if range_arg is not None:
+            ax.hist(values, bins=bins, range=range_arg, **hist_kwargs)
+        else:
+            ax.hist(values, bins=bins, **hist_kwargs)
+    except Exception:
+        # Fallback for precision/bin-edge failures (e.g., near-zero finite range).
+        if range_arg is not None:
+            ax.hist(values, bins=1, range=range_arg, **hist_kwargs)
+        else:
+            ax.hist(values, bins=1, **hist_kwargs)
 
 
 def _save_effect_distribution_plot(
@@ -822,7 +903,14 @@ def _save_effect_distribution_plot(
     q1, q3 = np.percentile(arr, [25, 75])
 
     fig, ax = plt.subplots(figsize=(6.4, 3.8))
-    ax.hist(arr, bins=bins, color="#4b8bd6", alpha=0.78, edgecolor="#ffffff")
+    _plot_hist_safe(
+        ax,
+        arr,
+        bins,
+        color="#4b8bd6",
+        alpha=0.78,
+        edgecolor="#ffffff",
+    )
     ax.axvline(0.0, color="#9f1239", linestyle="--", linewidth=1.4, label="0 reference")
     ax.axvline(median, color="#0f172a", linewidth=1.3, label="Median")
     if q3 > q1:
@@ -837,11 +925,9 @@ def _save_effect_distribution_plot(
     fig.tight_layout()
 
     slug_source = f"{name_prefix}:{effect_id}" if name_prefix else effect_id
-    filename = f"{_safe_slug(slug_source)}_distribution.png"
-    path = out_dir / filename
-    fig.savefig(path)
+    path = _save_plot_with_fallback(fig, out_dir, slug_source, "_distribution.png")
     plt.close(fig)
-    return str(path)
+    return path
 
 
 def _save_rank_stability_plot(
@@ -884,11 +970,9 @@ def _save_rank_stability_plot(
     fig.tight_layout()
 
     slug_source = f"{name_prefix}:{factor_name}" if name_prefix else factor_name
-    filename = f"{_safe_slug(slug_source)}_rank_stability.png"
-    path = out_dir / filename
-    fig.savefig(path)
+    path = _save_plot_with_fallback(fig, out_dir, slug_source, "_rank_stability.png")
     plt.close(fig)
-    return str(path)
+    return path
 
 
 def _bucket_from_metrics(
