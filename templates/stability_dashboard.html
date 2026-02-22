@@ -33,136 +33,148 @@
 
   <div class="panel">
     <h3>Effect Lineage Matrix</h3>
-    <p class="muted">Shows how combined effects are composed from group effects. Click a row to expand the composition drawer inline.</p>
-    {% if lineage_mock.rows %}
-      <div class="table-wrap">
-        <table class="lineage-matrix" data-sortable="true" data-sort-bundle="recipe">
-          <tr>
-            <th class="lineage-col-effect" data-sort-type="text">Effect</th>
-            <th class="lineage-col-type" data-sort-type="text">Type</th>
-            <th class="lineage-col-lineage" data-sort-type="text">Lineage Tag</th>
-            <th data-sort-type="bucket">Combined</th>
-            {% for gh in lineage_mock.group_headers %}
-              <th data-sort-type="bucket">
-                <div class="mono">{{ gh.group_key }}</div>
-                <div class="weight-mini-bar"><span style="width: {{ '%.1f'|format((gh.weight_normalized or 0) * 100) }}%;"></span></div>
-                <div class="muted">{{ '%.2f'|format(gh.weight_normalized or 0) }}</div>
-              </th>
-            {% endfor %}
-            <th data-sortable="false">Recipe</th>
-          </tr>
-          {% for row in lineage_mock.rows %}
-            <tr class="lineage-row" data-recipe-target="{{ row.recipe_id }}">
-              <td class="mono">{{ row.effect_id }}</td>
-              <td title="{{ row.effect_type_tooltip }}"><span class="lineage-type-text">{{ row.effect_type }}</span></td>
-              <td><span class="lineage-tag" title="{{ row.lineage_note }}">{{ row.lineage_tag }}</span></td>
-              <td>
-                {% if row.combined_bucket %}
-                  <span class="bucket-chip bucket-{{ row.combined_bucket|lower|replace('_', '-') }}" title="{{ row.combined_bucket_tooltip }}">{{ row.combined_bucket }}</span>
-                {% else %}
-                  <span class="muted">-</span>
-                {% endif %}
-              </td>
-              {% for gc in row.group_cells %}
-                <td>
-                  {% if gc.bucket %}
-                    <span class="bucket-chip bucket-{{ gc.bucket|lower|replace('_', '-') }}" title="{{ gc.bucket_tooltip }}">{{ gc.bucket }}</span>
-                  {% else %}
-                    <span class="muted">-</span>
-                  {% endif %}
-                </td>
-              {% endfor %}
-              <td><button type="button" class="link-btn lineage-recipe-btn" data-recipe-target="{{ row.recipe_id }}">View</button></td>
-            </tr>
-            <tr class="lineage-inline-row" id="{{ row.recipe_id }}" hidden>
-              <td colspan="{{ 5 + (lineage_mock.group_headers|length) }}">
-                <div class="lineage-inline-card">
-                  <div><strong class="mono">{{ row.effect_id }}</strong></div>
-                  <div class="muted">Lineage: {{ row.lineage_tag }}. {{ row.lineage_note }}</div>
-                  <div class="muted">
-                    Combined: {% if row.combined_bucket %}{{ row.combined_bucket }}{% else %}-{% endif %} |
-                    Factor: {{ row.factor_name }} {% if row.level_a %}| Levels: {{ row.level_a }} {% if row.level_b %}vs {{ row.level_b }}{% endif %}{% endif %}
-                  </div>
-                  <table data-sortable="true">
-                    <tr>
-                      <th data-sort-type="text">Group</th>
-                      <th data-sort-type="numeric">Weight (norm)</th>
-                      <th data-sort-type="text">Contributes</th>
-                      <th data-sort-type="bucket">Group Bucket</th>
-                      <th data-sortable="false">Plot</th>
-                      <th data-sort-type="numeric">Median</th>
-                      <th data-sort-type="numeric">IQR</th>
-                      <th data-sort-type="numeric">Rows</th>
-                      <th data-sort-type="text">Valid/Total Models</th>
-                    </tr>
-                    {% for c in row.contributors %}
-                      <tr>
-                        <td class="mono">{{ c.group_key }}</td>
-                        <td>{{ '%.3f'|format(c.weight_normalized or 0) }}</td>
-                        <td>{{ 'yes' if c.contributes else 'no' }}</td>
-                        <td>
-                          {% if c.bucket %}
-                            <span class="bucket-chip bucket-{{ c.bucket|lower|replace('_', '-') }}" title="{{ c.bucket_tooltip }}">{{ c.bucket }}</span>
+    <p class="muted">Shows how combined effects are composed from group effects. Expand an effect type, then click a row to open its group-level composition drawer inline.</p>
+    {% if lineage_sections %}
+      {% for section in lineage_sections %}
+        <details class="accordion-panel effect-type-panel" {% if loop.first %}open{% endif %}>
+          <summary>
+            <span class="effect-type-toggle" aria-hidden="true"></span>
+            <strong>{{ section.effect_type }}</strong> ({{ section.count }})
+            <span class="muted type-bucket-inline">
+              Stable {{ section.bucket_counts.STABLE }},
+              Conditional {{ section.bucket_counts.CONDITIONAL }},
+              Non-effect {{ section.bucket_counts.NON_EFFECT }},
+              Red-flag {{ section.bucket_counts.REDFLAG }}
+            </span>
+          </summary>
+          <div class="accordion-body">
+            <div class="table-wrap">
+              <table class="lineage-matrix" data-sortable="true" data-sort-bundle="recipe">
+                <tr>
+                  <th class="lineage-col-effect" data-sort-type="text">Effect</th>
+                  <th data-sort-type="text">Snapshot</th>
+                  <th class="lineage-col-lineage" data-sort-type="text">Lineage Tag</th>
+                  <th data-sort-type="bucket">Combined</th>
+                </tr>
+                {% for row in section.rows %}
+                  <tr class="lineage-row" data-recipe-target="{{ row.recipe_id }}">
+                    <td class="mono">{{ row.effect_id }}</td>
+                    <td>
+                      <div class="snapshot-quick {% if row.snapshot_digest.bucket == 'CONDITIONAL' %}snapshot-conditional{% endif %}">
+                        <div class="snapshot-main">
+                          {{ row.snapshot_digest.direction }} | Med {{ row.snapshot_digest.median_text }} | IQR {{ row.snapshot_digest.iqr_text }} | n={{ row.snapshot_digest.n_models }}
+                        </div>
+                        <div class="snapshot-drivers">
+                          {% if row.snapshot_digest.top_drivers %}
+                            {{ row.snapshot_digest.top_drivers|join(' · ') }}
                           {% else %}
-                            <span class="muted">-</span>
+                            <span class="muted">No dominant driver signal</span>
                           {% endif %}
-                        </td>
-                        <td>
-                          {% if c.plot_path %}
-                            <a class="plot-icon-btn" href="{{ url_for('sme.view_artifact', path=c.plot_path) }}" target="_blank" title="View group effect plot">&#128202;</a>
-                          {% else %}
-                            <span class="muted">-</span>
-                          {% endif %}
-                        </td>
-                        <td>{% if c.median is not none %}{{ '%.4f'|format(c.median) }}{% else %}<span class="muted">-</span>{% endif %}</td>
-                        <td>{% if c.iqr is not none %}{{ '%.4f'|format(c.iqr) }}{% else %}<span class="muted">-</span>{% endif %}</td>
-                        <td>{{ c.n_rows_after_outlier }}</td>
-                        <td>{{ c.n_models_valid }} / {{ c.n_models_total }}</td>
-                      </tr>
-                    {% endfor %}
-                  </table>
-                </div>
-              </td>
-            </tr>
-          {% endfor %}
-        </table>
-      </div>
+                        </div>
+                      </div>
+                    </td>
+                    <td><span class="lineage-tag" title="{{ row.lineage_note }}">{{ row.lineage_tag }}</span></td>
+                    <td>
+                      {% if row.combined_bucket %}
+                        <span class="bucket-chip bucket-{{ row.combined_bucket|lower|replace('_', '-') }}" title="{{ row.combined_bucket_tooltip }}">{{ row.combined_bucket }}</span>
+                        {% if row.combined_interactive_plot_path %}
+                          <button
+                            type="button"
+                            class="plot-icon-btn open-effect-modal"
+                            data-artifact-url="{{ url_for('sme.view_artifact', path=row.combined_interactive_plot_path) }}"
+                            title="Open combined interactive effect explorer"
+                          >&#128202;</button>
+                        {% endif %}
+                      {% else %}
+                        <span class="muted">-</span>
+                      {% endif %}
+                    </td>
+                  </tr>
+                  <tr class="lineage-inline-row" id="{{ row.recipe_id }}" hidden>
+                    <td colspan="4">
+                      <div class="lineage-inline-card">
+                        <table data-sortable="true">
+                          <tr>
+                            <th data-sort-type="text">Group</th>
+                            <th data-sort-type="numeric">Weight (effect norm)</th>
+                            <th data-sort-type="text">Contributes</th>
+                            <th data-sort-type="bucket">Group Bucket</th>
+                            <th data-sortable="false">Plot</th>
+                            <th data-sort-type="numeric">Median</th>
+                            <th data-sort-type="numeric">Primary Levels</th>
+                            <th data-sort-type="numeric">IQR</th>
+                            <th data-sort-type="numeric">Rows</th>
+                            <th data-sort-type="text">Valid/Total Models</th>
+                          </tr>
+                          {% for c in row.contributors %}
+                            <tr>
+                              <td class="mono">{{ c.group_key }}</td>
+                              <td>{% if c.contributes %}{{ '%.3f'|format(c.effect_weight_normalized or 0) }}{% else %}<span class="muted">-</span>{% endif %}</td>
+                              <td>{{ 'yes' if c.contributes else 'no' }}</td>
+                              <td>
+                                {% if c.bucket %}
+                                  <span class="bucket-chip bucket-{{ c.bucket|lower|replace('_', '-') }}" title="{{ c.bucket_tooltip }}">{{ c.bucket }}</span>
+                                {% else %}
+                                  <span class="muted">-</span>
+                                {% endif %}
+                              </td>
+                              <td>
+                                {% if c.interactive_plot_path %}
+                                  <button
+                                    type="button"
+                                    class="plot-icon-btn open-effect-modal"
+                                    data-artifact-url="{{ url_for('sme.view_artifact', path=c.interactive_plot_path) }}"
+                                    title="Open interactive group effect explorer"
+                                  >&#128202;</button>
+                                {% elif c.plot_path %}
+                                  <button
+                                    type="button"
+                                    class="plot-icon-btn open-effect-modal"
+                                    data-artifact-url="{{ url_for('sme.view_artifact', path=c.plot_path) }}"
+                                    title="Open static effect plot"
+                                  >&#128202;</button>
+                                {% else %}
+                                  <span class="muted">-</span>
+                                {% endif %}
+                              </td>
+                              <td>{% if c.median is not none %}{{ '%.4f'|format(c.median) }}{% else %}<span class="muted">-</span>{% endif %}</td>
+                              <td>{% if c.primary_level_count is not none %}{{ c.primary_level_count }}{% else %}<span class="muted">-</span>{% endif %}</td>
+                              <td>{% if c.iqr is not none %}{{ '%.4f'|format(c.iqr) }}{% else %}<span class="muted">-</span>{% endif %}</td>
+                              <td>{{ c.n_rows_after_outlier }}</td>
+                              <td>{{ c.n_models_valid }} / {{ c.n_models_total }}</td>
+                            </tr>
+                          {% endfor %}
+                        </table>
+                      </div>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </table>
+            </div>
+          </div>
+        </details>
+      {% endfor %}
     {% else %}
       <p class="muted">No lineage rows available yet.</p>
     {% endif %}
   </div>
-
-  <div class="panel">
-    <h3>Group Weights</h3>
-    <table data-sortable="true">
-      <tr>
-        <th data-sort-type="text">Group</th>
-        <th data-sort-type="numeric">Rows After Outlier</th>
-        <th data-sort-type="numeric">Total Models</th>
-        <th data-sort-type="numeric">Valid Models</th>
-        <th data-sort-type="numeric">Weight Raw</th>
-        <th data-sort-type="numeric">Weight Normalized</th>
-      </tr>
-      {% for w in stability.summary.group_weights %}
-        <tr>
-          <td class="mono">{{ w.group_key }}</td>
-          <td>{{ w.n_rows_after_outlier }}</td>
-          <td>{{ w.n_models_total }}</td>
-          <td>{{ w.n_models_valid }}</td>
-          <td>{{ '%.5f'|format(w.weight_raw) }}</td>
-          <td>{{ '%.5f'|format(w.weight_normalized) }}</td>
-        </tr>
-      {% endfor %}
-    </table>
-  </div>
 {% else %}
   <div class="panel"><p>No stability result yet.</p></div>
 {% endif %}
+<div id="effectModal" class="plot-modal" hidden>
+  <div class="plot-modal-dialog" role="dialog" aria-modal="true" aria-label="Effect Plot Explorer">
+    <div class="plot-modal-head">
+      <strong>Effect Plot Explorer</strong>
+      <button type="button" id="effectModalClose" class="link-btn">Close</button>
+    </div>
+    <div class="plot-modal-body">
+      <iframe id="effectModalFrame" title="Effect Plot Explorer" loading="lazy"></iframe>
+    </div>
+  </div>
+</div>
 <script>
   (function () {
     var rows = Array.from(document.querySelectorAll(".lineage-row"));
-    if (!rows.length) return;
-    var buttons = Array.from(document.querySelectorAll(".lineage-recipe-btn"));
     var cards = Array.from(document.querySelectorAll(".lineage-inline-row"));
     var activeId = "";
 
@@ -185,17 +197,48 @@
       }
     }
 
-    rows.forEach(function (row) {
-      row.addEventListener("click", function (ev) {
-        if (ev.target.closest("button")) return;
-        toggleTarget(row.getAttribute("data-recipe-target"));
+    if (rows.length) {
+      rows.forEach(function (row) {
+        row.addEventListener("click", function (ev) {
+          if (ev.target.closest("button")) return;
+          toggleTarget(row.getAttribute("data-recipe-target"));
+        });
       });
-    });
-    buttons.forEach(function (btn) {
+    }
+
+    var modal = document.getElementById("effectModal");
+    var modalFrame = document.getElementById("effectModalFrame");
+    var modalClose = document.getElementById("effectModalClose");
+    var plotButtons = Array.from(document.querySelectorAll(".open-effect-modal"));
+
+    function closeModal() {
+      if (!modal) return;
+      modal.hidden = true;
+      if (modalFrame) {
+        modalFrame.src = "about:blank";
+      }
+    }
+
+    plotButtons.forEach(function (btn) {
       btn.addEventListener("click", function (ev) {
         ev.preventDefault();
-        toggleTarget(btn.getAttribute("data-recipe-target"));
+        var url = btn.getAttribute("data-artifact-url");
+        if (!url || !modal || !modalFrame) return;
+        modal.hidden = false;
+        modalFrame.src = url;
       });
+    });
+
+    if (modalClose) {
+      modalClose.addEventListener("click", closeModal);
+    }
+    if (modal) {
+      modal.addEventListener("click", function (ev) {
+        if (ev.target === modal) closeModal();
+      });
+    }
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape") closeModal();
     });
   })();
 </script>

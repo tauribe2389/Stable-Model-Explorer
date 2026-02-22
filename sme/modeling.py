@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import itertools
 import hashlib
+import html
+import json
 import os
 import random
 from pathlib import Path
@@ -758,6 +760,640 @@ def _effect_sensitivity(effect_model_values: list[tuple[float, list[str]]], cand
     return {k: v for k, v in flags.items() if v}
 
 
+def _compact_metric_snapshot(metrics: dict[str, Any]) -> dict[str, float | int | None]:
+    return {
+        "adj_r2": _coerce_finite_float(metrics.get("adj_r2")),
+        "max_vif": _coerce_finite_float(metrics.get("max_vif")),
+        "bp_p": _coerce_finite_float(metrics.get("bp_p")),
+        "high_cook_count": int(metrics.get("high_cook_count", 0)) if str(metrics.get("high_cook_count", "")).strip() != "" else 0,
+    }
+
+
+def _build_effect_model_record(run: dict[str, Any], effect_value: float, included_terms: list[str]) -> dict[str, Any]:
+    metrics = run.get("metrics", {})
+    if not isinstance(metrics, dict):
+        metrics = {}
+    raw_interactions = run.get("interactions", [])
+    interactions = [str(x) for x in raw_interactions] if isinstance(raw_interactions, (list, tuple, set)) else []
+    return {
+        "run_id": int(run.get("id", 0) or 0),
+        "model_idx": int(run.get("model_idx", 0) or 0),
+        "base_model_idx": int(run.get("base_model_idx", 0) or 0),
+        "registry_id": int(run.get("registry_id", 0) or 0),
+        "group_key": str(run.get("group_key") or ALL_GROUP_KEY),
+        "model_class": str(run.get("model_class", MODEL_CLASS_ANOVA)),
+        "validity_class": str(run.get("validity_class", "")),
+        "effect_value": float(effect_value),
+        "included_terms": [str(t) for t in included_terms],
+        "interactions": interactions,
+        "metrics": _compact_metric_snapshot(metrics),
+    }
+
+
+def _term_presence_set(record: dict[str, Any]) -> set[str]:
+    terms = set(str(t) for t in record.get("included_terms", []) if str(t).strip())
+    terms.update(str(t) for t in record.get("interactions", []) if str(t).strip())
+    return terms
+
+
+def _compute_driver_deltas(records: list[dict[str, Any]], selected_indices: list[int] | None = None) -> list[dict[str, float | str]]:
+    if not records:
+        return []
+    all_sets = [_term_presence_set(r) for r in records]
+    all_terms = sorted(set().union(*all_sets)) if all_sets else []
+    if not all_terms:
+        return []
+
+    n_all = float(len(records))
+    overall_rate = {t: sum(1 for s in all_sets if t in s) / n_all for t in all_terms}
+    if selected_indices is None:
+        selected_indices = list(range(len(records)))
+    selected_indices = [int(i) for i in selected_indices if 0 <= int(i) < len(records)]
+    if not selected_indices:
+        return []
+    selected_sets = [all_sets[i] for i in selected_indices]
+    n_sel = float(len(selected_sets))
+    selected_rate = {t: sum(1 for s in selected_sets if t in s) / n_sel for t in all_terms}
+
+    deltas = []
+    for term in all_terms:
+        delta = float(selected_rate[term] - overall_rate[term])
+        if abs(delta) < 0.05:
+            continue
+        deltas.append(
+            {
+                "term": term,
+                "delta_rate": delta,
+                "selected_rate": float(selected_rate[term]),
+                "overall_rate": float(overall_rate[term]),
+            }
+        )
+    deltas.sort(key=lambda x: abs(float(x["delta_rate"])), reverse=True)
+    return deltas[:6]
+
+
+def _bin_records(records: list[dict[str, Any]], preferred_bins: int = 12) -> list[dict[str, Any]]:
+    if not records:
+        return []
+    values = np.array([float(r["effect_value"]) for r in records], dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return []
+
+    left = float(np.min(values))
+    right = float(np.max(values))
+    if right <= left:
+        right = float(np.nextafter(left, np.inf))
+    unique_count = int(np.unique(values).size)
+    n_bins = max(1, min(int(preferred_bins), unique_count if unique_count > 0 else 1))
+    edges = np.linspace(left, right, n_bins + 1)
+
+    bins: list[list[int]] = [[] for _ in range(n_bins)]
+    denom = right - left
+    for idx, rec in enumerate(records):
+        v = _coerce_finite_float(rec.get("effect_value"))
+        if v is None:
+            continue
+        rel = (float(v) - left) / denom if denom > 0 else 0.0
+        b = int(np.floor(rel * n_bins))
+        if b < 0:
+            b = 0
+        if b >= n_bins:
+            b = n_bins - 1
+        bins[b].append(idx)
+
+    out: list[dict[str, Any]] = []
+    for b_idx, indices in enumerate(bins):
+        if not indices:
+            continue
+        left_edge = float(edges[b_idx])
+        right_edge = float(edges[b_idx + 1])
+        drivers = _compute_driver_deltas(records, indices)
+        model_rows = []
+        for i in indices[:120]:
+            rec = records[i]
+            model_rows.append(
+                {
+                    "model_idx": int(rec.get("model_idx", 0)),
+                    "base_model_idx": int(rec.get("base_model_idx", 0)),
+                    "group_key": str(rec.get("group_key", "")),
+                    "model_class": str(rec.get("model_class", "")),
+                    "validity_class": str(rec.get("validity_class", "")),
+                    "effect_value": _coerce_finite_float(rec.get("effect_value")),
+                    "included_terms": list(rec.get("included_terms", [])),
+                    "interactions": list(rec.get("interactions", [])),
+                    "metrics": dict(rec.get("metrics", {})),
+                }
+            )
+        out.append(
+            {
+                "bin_idx": b_idx,
+                "left": left_edge,
+                "right": right_edge,
+                "count": len(indices),
+                "drivers": drivers,
+                "model_rows": model_rows,
+                "truncated": max(0, len(indices) - len(model_rows)),
+            }
+        )
+    return out
+
+
+def _effect_snapshot(
+    values: list[float],
+    bucket: str,
+    sign_consistency: float | None,
+    practical_rate: float | None,
+    model_records: list[dict[str, Any]],
+    sensitivity_flags: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    dist = _estimate_distribution(values)
+    median = float(dist.get("median", 0.0))
+    iqr = float(dist.get("iqr", 0.0))
+    sign_val = _coerce_finite_float(sign_consistency)
+    practical_val = _coerce_finite_float(practical_rate)
+    direction = "MIXED"
+    if sign_val is not None and sign_val >= 0.95:
+        direction = "POSITIVE" if median >= 0 else "NEGATIVE"
+    elif sign_val is not None and sign_val >= 0.8:
+        direction = "MOSTLY_POS" if median >= 0 else "MOSTLY_NEG"
+
+    drivers = _compute_driver_deltas(model_records, None)
+    top_driver_labels = [f"{d['term']} ({float(d['delta_rate']):+.2f})" for d in drivers[:2]]
+    if not top_driver_labels and sensitivity_flags:
+        top_driver_labels = [str(k).split(":", 1)[-1] for k, v in sensitivity_flags.items() if bool(v)][:2]
+
+    return {
+        "bucket": str(bucket),
+        "direction": direction,
+        "median": median,
+        "iqr": iqr,
+        "n_models": int(len(model_records)),
+        "sign_consistency": float(sign_val) if sign_val is not None else None,
+        "practical_rate": float(practical_val) if practical_val is not None else None,
+        "top_drivers": top_driver_labels,
+        "spread_class": "WIDE" if iqr >= 0.5 else ("TIGHT" if iqr <= 0.1 else "MODERATE"),
+    }
+
+
+def _html_path_budget(out_dir: Path, suffix: str, default: int = 52) -> int:
+    if os.name != "nt":
+        return default
+    base = str(out_dir.resolve(strict=False))
+    max_path_target = 235
+    available = max_path_target - len(base) - 1 - len(suffix)
+    return max(10, min(default, available))
+
+
+def _save_html_artifact_with_fallback(out_dir: Path, slug_source: str, suffix: str, html_text: str) -> str | None:
+    slug_lengths = [_html_path_budget(out_dir, suffix), 28, 16]
+    seen: set[str] = set()
+    for slug_len in slug_lengths:
+        slug = _safe_slug(slug_source, max_len=slug_len)
+        if slug in seen:
+            continue
+        seen.add(slug)
+        path = out_dir / f"{slug}{suffix}"
+        try:
+            path.write_text(html_text, encoding="utf-8")
+            return str(path)
+        except Exception as exc:
+            if not _is_path_save_error(exc):
+                raise
+            continue
+    return None
+
+
+def _plotly_artifact_html(
+    title: str,
+    x_label: str,
+    model_records: list[dict[str, Any]],
+    bin_rows: list[dict[str, Any]],
+    snapshot: dict[str, Any],
+) -> str:
+    from plotly import graph_objects as go
+    import plotly.io as pio
+    from plotly.subplots import make_subplots
+
+    values = [float(r["effect_value"]) for r in model_records]
+    arr = np.array(values, dtype=float)
+    mean_val = float(np.mean(arr))
+    median_val = float(np.median(arr))
+    q1, q3 = np.percentile(arr, [25, 75])
+    q1 = float(q1)
+    q3 = float(q3)
+    jitter_rng = np.random.RandomState(13)
+    jitter = jitter_rng.normal(loc=0.0, scale=0.06, size=len(values))
+    customdata = [
+        [
+            int(r.get("model_idx", 0)),
+            str(r.get("group_key", "")),
+            str(r.get("model_class", "")),
+            ", ".join(str(t) for t in r.get("included_terms", []))[:240],
+            ", ".join(str(t) for t in r.get("interactions", []))[:160],
+        ]
+        for r in model_records
+    ]
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        row_heights=[0.72, 0.28],
+        vertical_spacing=0.08,
+    )
+    bin_centers = [0.5 * (float(b.get("left", 0.0)) + float(b.get("right", 0.0))) for b in bin_rows]
+    bin_widths = [max(1e-12, float(b.get("right", 0.0)) - float(b.get("left", 0.0))) for b in bin_rows]
+    bin_counts = [int(b.get("count", 0) or 0) for b in bin_rows]
+    bin_custom = [
+        [int(b.get("bin_idx", i)), float(b.get("left", 0.0)), float(b.get("right", 0.0))]
+        for i, b in enumerate(bin_rows)
+    ]
+    fig.add_trace(
+        go.Bar(
+            x=bin_centers,
+            y=bin_counts,
+            width=bin_widths,
+            customdata=bin_custom,
+            name="Distribution",
+            marker={"color": "#4b8bd6", "opacity": 0.78, "line": {"color": "#ffffff", "width": 1}},
+            hovertemplate="Range %{customdata[1]:.4f} to %{customdata[2]:.4f}<br>Count %{y}<extra></extra>",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=values,
+            y=jitter.tolist(),
+            mode="markers",
+            name="Models",
+            marker={"size": 7, "color": "#0f172a", "opacity": 0.45},
+            customdata=customdata,
+            hovertemplate=(
+                "Effect %{x:.4f}<br>"
+                "Model %{customdata[0]}<br>"
+                "Group %{customdata[1]}<br>"
+                "Class %{customdata[2]}<br>"
+                "Terms %{customdata[3]}<br>"
+                "Interactions %{customdata[4]}<extra></extra>"
+            ),
+        ),
+        row=2,
+        col=1,
+    )
+    fig.add_vline(x=0.0, line_dash="dash", line_color="#9f1239", line_width=1.2, row="all", col=1)
+    fig.add_vrect(x0=q1, x1=q3, fillcolor="rgba(147,197,253,0.25)", line_width=0, row=1, col=1)
+    fig.add_vline(x=mean_val, line_color="#0f172a", line_width=1.4, annotation_text="Mean", annotation_position="top", row=1, col=1)
+    fig.add_vline(
+        x=median_val,
+        line_color="#1d4ed8",
+        line_width=1.4,
+        annotation_text="Median",
+        annotation_position="top right",
+        row=1,
+        col=1,
+    )
+    x_range = None
+    if bin_rows:
+        left = float(bin_rows[0].get("left", np.min(arr)))
+        right = float(bin_rows[-1].get("right", np.max(arr)))
+        if right <= left:
+            right = float(np.nextafter(left, np.inf))
+        x_range = [left, right]
+    fig.update_yaxes(title_text="Model Count", row=1, col=1)
+    fig.update_yaxes(title_text="Model Spread", row=2, col=1, showticklabels=False, range=[-0.25, 0.25])
+    fig.update_xaxes(range=x_range, row=1, col=1)
+    fig.update_xaxes(title_text=f"{x_label} (mean={mean_val:.4f}, IQR={q1:.4f} to {q3:.4f})", range=x_range, row=2, col=1)
+    fig.update_layout(
+        title={"text": title, "x": 0.01},
+        template="plotly_white",
+        legend={"orientation": "h"},
+        hovermode="closest",
+        height=620,
+        margin={"l": 55, "r": 45, "t": 70, "b": 55},
+    )
+
+    plot_html = pio.to_html(
+        fig,
+        full_html=False,
+        include_plotlyjs="inline",
+        config={"responsive": True, "displaylogo": False},
+        div_id="effect_plot",
+    )
+
+    payload = {
+        "title": title,
+        "xLabel": x_label,
+        "snapshot": snapshot,
+        "bins": bin_rows,
+    }
+    data_json = json.dumps(payload, ensure_ascii=True)
+    safe_title = html.escape(title)
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{safe_title}</title>
+  <style>
+    body {{ font-family: "Segoe UI", Tahoma, sans-serif; margin: 0; padding: 12px; color: #1f2937; background: #f8fafc; }}
+    .card {{ background: #fff; border: 1px solid #d1d5db; border-radius: 8px; padding: 10px; margin-bottom: 10px; }}
+    .title {{ font-size: 16px; font-weight: 700; margin-bottom: 8px; }}
+    .muted {{ color: #6b7280; font-size: 12px; }}
+    .grid {{ display: grid; grid-template-columns: 1.2fr 1fr; gap: 10px; }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th, td {{ border: 1px solid #d1d5db; padding: 6px 7px; font-size: 12px; text-align: left; vertical-align: top; }}
+    th {{ background: #e9f0f8; }}
+    @media (max-width: 900px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="title">{safe_title}</div>
+    <div class="muted">Hover or click histogram columns to inspect model composition and dominant term differences for that region.</div>
+  </div>
+  <div class="card">
+    {plot_html}
+  </div>
+  <div class="grid">
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:6px;">Bin Driver Summary</div>
+      <div id="binMeta" class="muted"></div>
+      <table id="driverTable">
+        <tr><th>Term</th><th>Delta Rate</th><th>In Bin</th><th>Overall</th></tr>
+      </table>
+    </div>
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:6px;">Models In Bin</div>
+      <table id="modelTable">
+        <tr><th>Model</th><th>Group</th><th>Class</th><th>Effect</th><th>Terms</th></tr>
+      </table>
+      <div id="modelTrunc" class="muted"></div>
+    </div>
+  </div>
+  <script>
+    const data = {data_json};
+    const metaEl = document.getElementById("binMeta");
+    const driverTable = document.getElementById("driverTable");
+    const modelTable = document.getElementById("modelTable");
+    const modelTrunc = document.getElementById("modelTrunc");
+    const plotEl = document.getElementById("effect_plot");
+
+    function clearRows(table) {{
+      while (table.rows.length > 1) table.deleteRow(1);
+    }}
+    function fmt(x) {{
+      if (x === null || x === undefined || Number.isNaN(x)) return "-";
+      return Number(x).toFixed(4);
+    }}
+    function findBinByX(x) {{
+      const value = Number(x);
+      if (!Number.isFinite(value)) return -1;
+      for (let i = 0; i < data.bins.length; i += 1) {{
+        const b = data.bins[i];
+        const left = Number(b.left);
+        const right = Number(b.right);
+        const isLast = i === data.bins.length - 1;
+        if ((value >= left && value < right) || (isLast && value <= right)) {{
+          return i;
+        }}
+      }}
+      return -1;
+    }}
+    function selectBin(idx) {{
+      const b = data.bins[idx];
+      if (!b) return;
+      metaEl.textContent = `Range ${{fmt(b.left)}} to ${{fmt(b.right)}} | count=${{b.count}}`;
+
+      clearRows(driverTable);
+      (b.drivers || []).forEach(d => {{
+        const r = driverTable.insertRow(-1);
+        r.insertCell(0).textContent = d.term;
+        r.insertCell(1).textContent = (d.delta_rate >= 0 ? "+" : "") + Number(d.delta_rate).toFixed(2);
+        r.insertCell(2).textContent = Number(d.selected_rate).toFixed(2);
+        r.insertCell(3).textContent = Number(d.overall_rate).toFixed(2);
+      }});
+
+      clearRows(modelTable);
+      (b.model_rows || []).forEach(m => {{
+        const r = modelTable.insertRow(-1);
+        r.insertCell(0).textContent = String(m.model_idx || "");
+        r.insertCell(1).textContent = String(m.group_key || "");
+        r.insertCell(2).textContent = String(m.model_class || "");
+        r.insertCell(3).textContent = fmt(m.effect_value);
+        r.insertCell(4).textContent = (m.included_terms || []).join(", ");
+      }});
+      modelTrunc.textContent = b.truncated > 0 ? `${{b.truncated}} additional models not shown in table.` : "";
+    }}
+
+    function handlePlotEvent(ev) {{
+      if (!ev || !ev.points || !ev.points.length) return;
+      const p = ev.points[0];
+      const traceIdx = Number(p.curveNumber);
+      if (traceIdx === 0) {{
+        const idxFromPoint = Number(p.pointNumber);
+        if (Number.isFinite(idxFromPoint)) {{
+          selectBin(idxFromPoint);
+          return;
+        }}
+        const cd = p.customdata;
+        if (Array.isArray(cd) && cd.length > 0) {{
+          const idxFromCd = Number(cd[0]);
+          if (Number.isFinite(idxFromCd)) {{
+            selectBin(idxFromCd);
+            return;
+          }}
+        }}
+      }}
+      if (traceIdx === 0 || traceIdx === 1) {{
+        const idx = findBinByX(p.x);
+        if (idx >= 0) selectBin(idx);
+      }}
+    }}
+
+    if (plotEl && plotEl.on) {{
+      plotEl.on("plotly_hover", handlePlotEvent);
+      plotEl.on("plotly_click", handlePlotEvent);
+    }}
+    if (data.bins.length) selectBin(0);
+  </script>
+</body>
+</html>
+"""
+
+
+def _fallback_artifact_html(
+    title: str,
+    x_label: str,
+    model_records: list[dict[str, Any]],
+    bin_rows: list[dict[str, Any]],
+    snapshot: dict[str, Any],
+    fallback_reason: str | None = None,
+) -> str:
+    payload = {
+        "title": title,
+        "xLabel": x_label,
+        "snapshot": snapshot,
+        "bins": bin_rows,
+    }
+    data_json = json.dumps(payload, ensure_ascii=True)
+    safe_title = html.escape(title)
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{safe_title}</title>
+  <style>
+    body {{ font-family: "Segoe UI", Tahoma, sans-serif; margin: 0; padding: 12px; color: #1f2937; background: #f8fafc; }}
+    .card {{ background: #fff; border: 1px solid #d1d5db; border-radius: 8px; padding: 10px; margin-bottom: 10px; }}
+    .title {{ font-size: 16px; font-weight: 700; margin-bottom: 8px; }}
+    .muted {{ color: #6b7280; font-size: 12px; }}
+    .hist {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(28px, 1fr)); gap: 6px; align-items: end; min-height: 140px; }}
+    .bar {{ border: 1px solid #b7cae5; background: linear-gradient(180deg, #c9dcf3, #4b8bd6); border-radius: 4px 4px 0 0; cursor: pointer; position: relative; }}
+    .bar.active {{ outline: 2px solid #0b5cab; }}
+    .bar-label {{ font-size: 11px; text-align: center; margin-top: 3px; color: #475569; }}
+    .grid {{ display: grid; grid-template-columns: 1.2fr 1fr; gap: 10px; }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th, td {{ border: 1px solid #d1d5db; padding: 6px 7px; font-size: 12px; text-align: left; vertical-align: top; }}
+    th {{ background: #e9f0f8; }}
+    @media (max-width: 900px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="title">{safe_title}</div>
+    <div class="muted">Hover or click a histogram bar to inspect models and dominant term differences for that region.</div>
+    {f'<div class="muted">Fallback renderer used: {html.escape(str(fallback_reason))}</div>' if fallback_reason else ''}
+  </div>
+  <div class="card">
+    <div id="hist" class="hist"></div>
+  </div>
+  <div class="grid">
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:6px;">Bin Driver Summary</div>
+      <div id="binMeta" class="muted"></div>
+      <table id="driverTable">
+        <tr><th>Term</th><th>Delta Rate</th><th>In Bin</th><th>Overall</th></tr>
+      </table>
+    </div>
+    <div class="card">
+      <div style="font-weight:600;margin-bottom:6px;">Models In Bin</div>
+      <table id="modelTable">
+        <tr><th>Model</th><th>Group</th><th>Class</th><th>Effect</th><th>Terms</th></tr>
+      </table>
+      <div id="modelTrunc" class="muted"></div>
+    </div>
+  </div>
+  <script>
+    const data = {data_json};
+    const histEl = document.getElementById("hist");
+    const metaEl = document.getElementById("binMeta");
+    const driverTable = document.getElementById("driverTable");
+    const modelTable = document.getElementById("modelTable");
+    const modelTrunc = document.getElementById("modelTrunc");
+    const maxCount = Math.max(...data.bins.map(b => b.count), 1);
+
+    function clearRows(table) {{
+      while (table.rows.length > 1) table.deleteRow(1);
+    }}
+    function fmt(x) {{
+      if (x === null || x === undefined || Number.isNaN(x)) return "-";
+      return Number(x).toFixed(4);
+    }}
+    function selectBin(idx) {{
+      data.bins.forEach((b, i) => {{
+        const bar = document.getElementById("bar_" + i);
+        if (bar) bar.classList.toggle("active", i === idx);
+      }});
+      const b = data.bins[idx];
+      if (!b) return;
+      metaEl.textContent = `Range ${{fmt(b.left)}} to ${{fmt(b.right)}} | count=${{b.count}}`;
+
+      clearRows(driverTable);
+      (b.drivers || []).forEach(d => {{
+        const r = driverTable.insertRow(-1);
+        r.insertCell(0).textContent = d.term;
+        r.insertCell(1).textContent = (d.delta_rate >= 0 ? "+" : "") + Number(d.delta_rate).toFixed(2);
+        r.insertCell(2).textContent = Number(d.selected_rate).toFixed(2);
+        r.insertCell(3).textContent = Number(d.overall_rate).toFixed(2);
+      }});
+
+      clearRows(modelTable);
+      (b.model_rows || []).forEach(m => {{
+        const r = modelTable.insertRow(-1);
+        r.insertCell(0).textContent = String(m.model_idx || "");
+        r.insertCell(1).textContent = String(m.group_key || "");
+        r.insertCell(2).textContent = String(m.model_class || "");
+        r.insertCell(3).textContent = fmt(m.effect_value);
+        r.insertCell(4).textContent = (m.included_terms || []).join(", ");
+      }});
+      modelTrunc.textContent = b.truncated > 0 ? `${{b.truncated}} additional models not shown in table.` : "";
+    }}
+
+    data.bins.forEach((b, i) => {{
+      const wrap = document.createElement("div");
+      const bar = document.createElement("div");
+      bar.className = "bar";
+      bar.id = "bar_" + i;
+      bar.style.height = Math.max(12, Math.round((b.count / maxCount) * 120)) + "px";
+      bar.title = `Range ${{fmt(b.left)}} to ${{fmt(b.right)}} | count=${{b.count}}`;
+      bar.addEventListener("mouseenter", () => selectBin(i));
+      bar.addEventListener("click", () => selectBin(i));
+      const label = document.createElement("div");
+      label.className = "bar-label";
+      label.textContent = String(b.count);
+      wrap.appendChild(bar);
+      wrap.appendChild(label);
+      histEl.appendChild(wrap);
+    }});
+    if (data.bins.length) selectBin(0);
+  </script>
+</body>
+</html>
+"""
+
+
+def _save_effect_interactive_artifact(
+    out_dir: Path,
+    effect_id: str,
+    effect_type: str,
+    factor_name: str | None,
+    bucket: str,
+    model_records: list[dict[str, Any]],
+    snapshot: dict[str, Any],
+    name_prefix: str = "",
+) -> str | None:
+    if not model_records:
+        return None
+
+    x_label = "Effect value (rank)" if effect_type == "RANKING" else "Effect value"
+    title_parts = [str(effect_type), str(effect_id)]
+    if factor_name:
+        title_parts.append(f"factor={factor_name}")
+    title = " | ".join(title_parts)
+    bins = _bin_records(model_records, preferred_bins=12)
+    if not bins:
+        return None
+
+    html_text: str
+    try:
+        html_text = _plotly_artifact_html(title, x_label, model_records, bins, snapshot)
+    except Exception as exc:
+        html_text = _fallback_artifact_html(
+            title,
+            x_label,
+            model_records,
+            bins,
+            snapshot,
+            fallback_reason=f"{type(exc).__name__}: {exc}",
+        )
+
+    slug_source = f"{name_prefix}:{effect_id}:interactive"
+    return _save_html_artifact_with_fallback(out_dir, slug_source, "_interactive.html", html_text)
+
+
 def _bucket_effect(
     values: list[float],
     practical_threshold: float,
@@ -1177,12 +1813,23 @@ def run_stability_analysis(
                     if pval is None:
                         pval = 1.0
                     key = f"SLOPE:{cov}"
-                    slot = slope_map.setdefault(key, {"values": [], "pvalues": [], "class_values": {}, "class_pvalues": {}, "model_values": []})
+                    slot = slope_map.setdefault(
+                        key,
+                        {
+                            "values": [],
+                            "pvalues": [],
+                            "class_values": {},
+                            "class_pvalues": {},
+                            "model_values": [],
+                            "model_records": [],
+                        },
+                    )
                     slot["values"].append(val)
                     slot["pvalues"].append(pval)
                     slot["class_values"].setdefault(model_class, []).append(val)
                     slot["class_pvalues"].setdefault(model_class, []).append(pval)
                     slot["model_values"].append((val, included_terms))
+                    slot["model_records"].append(_build_effect_model_record(run, val, included_terms))
 
             lsmeans = run.get("lsmeans", {})
             if not isinstance(lsmeans, dict):
@@ -1200,10 +1847,22 @@ def run_stability_analysis(
                     if not level_a or not level_b or val is None:
                         continue
                     key = f"PAIRWISE_DIFF:{factor}:{level_a}:{level_b}"
-                    slot = pair_map.setdefault(key, {"factor": factor, "a": level_a, "b": level_b, "values": [], "class_values": {}, "model_values": []})
+                    slot = pair_map.setdefault(
+                        key,
+                        {
+                            "factor": factor,
+                            "a": level_a,
+                            "b": level_b,
+                            "values": [],
+                            "class_values": {},
+                            "model_values": [],
+                            "model_records": [],
+                        },
+                    )
                     slot["values"].append(val)
                     slot["class_values"].setdefault(model_class, []).append(val)
                     slot["model_values"].append((val, included_terms))
+                    slot["model_records"].append(_build_effect_model_record(run, val, included_terms))
                 for rank, entry in enumerate(fac.get("adjusted_means", []), start=1):
                     if not isinstance(entry, dict):
                         continue
@@ -1212,9 +1871,13 @@ def run_stability_analysis(
                         continue
                     rank_value = float(rank)
                     key = f"RANKING:{factor}:{level}"
-                    slot = rank_map.setdefault(key, {"factor": factor, "level": level, "values": [], "class_values": {}})
+                    slot = rank_map.setdefault(
+                        key,
+                        {"factor": factor, "level": level, "values": [], "class_values": {}, "model_records": []},
+                    )
                     slot["values"].append(rank_value)
                     slot["class_values"].setdefault(model_class, []).append(rank_value)
+                    slot["model_records"].append(_build_effect_model_record(run, rank_value, included_terms))
 
             for inter in interaction_candidates:
                 left_right = [p.strip() for p in inter.split(":")]
@@ -1228,10 +1891,14 @@ def run_stability_analysis(
                     continue
                 value = max(candidate_values)
                 key = f"INTERACTION_FLAG:{inter}"
-                slot = interaction_map.setdefault(key, {"interaction": inter, "values": [], "class_values": {}, "model_values": []})
+                slot = interaction_map.setdefault(
+                    key,
+                    {"interaction": inter, "values": [], "class_values": {}, "model_values": [], "model_records": []},
+                )
                 slot["values"].append(value)
                 slot["class_values"].setdefault(model_class, []).append(value)
                 slot["model_values"].append((value, included_terms))
+                slot["model_records"].append(_build_effect_model_record(run, value, included_terms))
 
         rank_by_factor: dict[str, dict[str, list[float]]] = {}
         for slot in rank_map.values():
@@ -1252,6 +1919,18 @@ def run_stability_analysis(
                 thresholds["sign_flip_redflag_pct"],
                 has_sensitivity=bool(sens),
             )
+            model_records = list(slot.get("model_records", []))
+            snapshot = _effect_snapshot(slot["values"], bucket, sign_consistency, practical_rate, model_records, sens)
+            interactive_plot_path = _save_effect_interactive_artifact(
+                plot_dir,
+                key,
+                "PAIRWISE_DIFF",
+                str(slot["factor"]),
+                bucket,
+                model_records,
+                snapshot,
+                name_prefix=name_prefix,
+            )
             effects.append({
                 "effect_id": key,
                 "effect_type": "PAIRWISE_DIFF",
@@ -1266,6 +1945,8 @@ def run_stability_analysis(
                 "sensitivity_flags": sens,
                 "bucket": bucket,
                 "plot_path": _save_effect_distribution_plot(plot_dir, key, slot["values"], "Effect value (pairwise difference)", name_prefix=name_prefix),
+                "interactive_plot_path": interactive_plot_path,
+                "snapshot": snapshot,
                 "narrative": f"{slot['factor']}: {slot['a']} vs {slot['b']} is {bucket.lower()} across valid models.",
                 "stratified_summaries": _stratified_metrics(slot["class_values"], {}, thresholds),
             })
@@ -1279,6 +1960,8 @@ def run_stability_analysis(
                 "class_values": {k: list(v) for k, v in slot["class_values"].items()},
                 "class_pvalues": {},
                 "sensitivity_flags": sens,
+                "model_records": model_records,
+                "snapshot": snapshot,
             }
 
         for key, slot in slope_map.items():
@@ -1294,6 +1977,18 @@ def run_stability_analysis(
                 has_sensitivity=bool(sens),
             )
             cov_name = key.split(":", 1)[1]
+            model_records = list(slot.get("model_records", []))
+            snapshot = _effect_snapshot(slot["values"], bucket, sign_consistency, practical_rate, model_records, sens)
+            interactive_plot_path = _save_effect_interactive_artifact(
+                plot_dir,
+                key,
+                "SLOPE",
+                cov_name,
+                bucket,
+                model_records,
+                snapshot,
+                name_prefix=name_prefix,
+            )
             effects.append({
                 "effect_id": key,
                 "effect_type": "SLOPE",
@@ -1308,6 +2003,8 @@ def run_stability_analysis(
                 "sensitivity_flags": sens,
                 "bucket": bucket,
                 "plot_path": _save_effect_distribution_plot(plot_dir, key, slot["values"], "Effect value (slope)", name_prefix=name_prefix),
+                "interactive_plot_path": interactive_plot_path,
+                "snapshot": snapshot,
                 "narrative": f"Slope for {cov_name} is {bucket.lower()} across model universe.",
                 "stratified_summaries": _stratified_metrics(slot["class_values"], slot["class_pvalues"], thresholds),
             })
@@ -1321,12 +2018,26 @@ def run_stability_analysis(
                 "class_values": {k: list(v) for k, v in slot["class_values"].items()},
                 "class_pvalues": {k: list(v) for k, v in slot["class_pvalues"].items()},
                 "sensitivity_flags": sens,
+                "model_records": model_records,
+                "snapshot": snapshot,
             }
 
         for key, slot in rank_map.items():
             dist = _estimate_distribution(slot["values"])
             iqr = dist["iqr"]
             bucket = BUCKET_STABLE if iqr <= 1.0 else BUCKET_CONDITIONAL
+            model_records = list(slot.get("model_records", []))
+            snapshot = _effect_snapshot(slot["values"], bucket, None, None, model_records, {})
+            interactive_plot_path = _save_effect_interactive_artifact(
+                plot_dir,
+                key,
+                "RANKING",
+                str(slot["factor"]),
+                bucket,
+                model_records,
+                snapshot,
+                name_prefix=name_prefix,
+            )
             effects.append({
                 "effect_id": key,
                 "effect_type": "RANKING",
@@ -1341,6 +2052,8 @@ def run_stability_analysis(
                 "sensitivity_flags": {},
                 "bucket": bucket,
                 "plot_path": rank_plot_paths.get(str(slot["factor"])),
+                "interactive_plot_path": interactive_plot_path,
+                "snapshot": snapshot,
                 "narrative": f"Level {slot['level']} ranking for {slot['factor']} has rank IQR {iqr:.2f}.",
                 "stratified_summaries": {cls: {"estimate_distribution": _estimate_distribution(vals), "n_models": len(vals)} for cls, vals in slot["class_values"].items()},
             })
@@ -1354,6 +2067,8 @@ def run_stability_analysis(
                 "class_values": {k: list(v) for k, v in slot["class_values"].items()},
                 "class_pvalues": {},
                 "sensitivity_flags": {},
+                "model_records": model_records,
+                "snapshot": snapshot,
             }
 
         for key, slot in interaction_map.items():
@@ -1368,6 +2083,19 @@ def run_stability_analysis(
                 thresholds["sign_flip_redflag_pct"],
                 has_sensitivity=bool(sens),
             )
+            model_records = list(slot.get("model_records", []))
+            bucket_out = BUCKET_CONDITIONAL if bucket == BUCKET_STABLE else bucket
+            snapshot = _effect_snapshot(slot["values"], bucket_out, sign_consistency, practical_rate, model_records, sens)
+            interactive_plot_path = _save_effect_interactive_artifact(
+                plot_dir,
+                key,
+                "INTERACTION_FLAG",
+                str(slot["interaction"]),
+                bucket_out,
+                model_records,
+                snapshot,
+                name_prefix=name_prefix,
+            )
             effects.append({
                 "effect_id": key,
                 "effect_type": "INTERACTION_FLAG",
@@ -1380,8 +2108,10 @@ def run_stability_analysis(
                 "equivalence_rate": equivalence_rate,
                 "p_sig_rate": None,
                 "sensitivity_flags": sens,
-                "bucket": BUCKET_CONDITIONAL if bucket == BUCKET_STABLE else bucket,
+                "bucket": bucket_out,
                 "plot_path": None,
+                "interactive_plot_path": interactive_plot_path,
+                "snapshot": snapshot,
                 "narrative": f"Interaction {slot['interaction']} signals conditional behavior.",
                 "stratified_summaries": _stratified_metrics(slot["class_values"], {}, thresholds),
             })
@@ -1395,6 +2125,8 @@ def run_stability_analysis(
                 "class_values": {k: list(v) for k, v in slot["class_values"].items()},
                 "class_pvalues": {},
                 "sensitivity_flags": sens,
+                "model_records": model_records,
+                "snapshot": snapshot,
             }
 
         effects.sort(key=lambda x: (x["bucket"], x["effect_type"], x["effect_id"]))
@@ -1500,6 +2232,7 @@ def run_stability_analysis(
         pvalue_pairs: list[tuple[float, float]] = []
         class_values: dict[str, list[tuple[float, float]]] = {}
         class_pvalues: dict[str, list[tuple[float, float]]] = {}
+        combined_model_records: list[dict[str, Any]] = []
         for group_key, payload in entries:
             g_weight = float(normalized_weights.get(group_key, 0.0))
             if g_weight <= 0:
@@ -1525,6 +2258,17 @@ def run_stability_analysis(
             for k, v in payload.get("sensitivity_flags", {}).items():
                 if v:
                     sensitivity_flags[k] = True
+            raw_records = payload.get("model_records", [])
+            if isinstance(raw_records, list):
+                for rec in raw_records:
+                    if isinstance(rec, dict):
+                        rec_copy = dict(rec)
+                        rec_copy["group_key"] = str(rec_copy.get("group_key") or group_key)
+                        effect_val = _coerce_finite_float(rec_copy.get("effect_value"))
+                        if effect_val is None:
+                            continue
+                        rec_copy["effect_value"] = effect_val
+                        combined_model_records.append(rec_copy)
 
         weighted = _weighted_effect_metrics(value_pairs, pvalue_pairs, thresholds, has_sensitivity=bool(sensitivity_flags))
         stratified_summaries = {}
@@ -1547,6 +2291,25 @@ def run_stability_analysis(
         elif first["effect_type"] == "RANKING":
             x_label = "Rank value"
 
+        snapshot = _effect_snapshot(
+            [float(v) for v, _ in value_pairs],
+            str(weighted["bucket"]),
+            _coerce_finite_float(weighted.get("sign_consistency")),
+            _coerce_finite_float(weighted.get("practical_rate")),
+            combined_model_records,
+            sensitivity_flags,
+        )
+        interactive_plot_path = _save_effect_interactive_artifact(
+            plot_dir,
+            effect_id,
+            str(first.get("effect_type", "")),
+            str(first.get("factor_name") or ""),
+            str(weighted["bucket"]),
+            combined_model_records,
+            snapshot,
+            name_prefix="combined",
+        )
+
         combined_effects.append({
             "effect_id": effect_id,
             "effect_type": first["effect_type"],
@@ -1561,6 +2324,8 @@ def run_stability_analysis(
             "sensitivity_flags": sensitivity_flags,
             "bucket": weighted["bucket"],
             "plot_path": _save_effect_distribution_plot(plot_dir, effect_id, [v for v, _ in value_pairs], x_label, name_prefix="combined"),
+            "interactive_plot_path": interactive_plot_path,
+            "snapshot": snapshot,
             "narrative": "Combined across groups with normalized row/quality weighting.",
             "stratified_summaries": stratified_summaries,
         })

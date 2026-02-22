@@ -214,6 +214,69 @@ def _bucket_tooltip(bucket: str) -> str:
     return mapping.get(key, "Bucket classification.")
 
 
+def _snapshot_digest(snapshot: dict[str, Any] | None, bucket: str | None = None) -> dict[str, Any]:
+    snap = snapshot if isinstance(snapshot, dict) else {}
+    direction = str(snap.get("direction", "")).strip() or "-"
+    spread = str(snap.get("spread_class", "")).strip() or "-"
+    n_models = int(snap.get("n_models", 0) or 0)
+    median = snap.get("median")
+    iqr = snap.get("iqr")
+    drivers = [str(x) for x in snap.get("top_drivers", []) if str(x).strip()]
+    med_text = f"{float(median):.3f}" if median is not None else "-"
+    iqr_text = f"{float(iqr):.3f}" if iqr is not None else "-"
+    bucket_key = str(bucket or snap.get("bucket", "")).strip().upper()
+    return {
+        "bucket": bucket_key,
+        "direction": direction,
+        "spread_class": spread,
+        "n_models": n_models,
+        "median_text": med_text,
+        "iqr_text": iqr_text,
+        "top_drivers": drivers[:2],
+    }
+
+
+def _primary_level_count_for_group(
+    effect_map: dict[str, dict[str, Any]] | None,
+    *,
+    effect_type: str,
+    factor_name: str,
+) -> int | None:
+    if not effect_map:
+        return None
+    factor = str(factor_name or "").strip()
+    if not factor:
+        return None
+    etype = str(effect_type or "").strip().upper()
+
+    levels: set[str] = set()
+    if etype == "RANKING":
+        for eff in effect_map.values():
+            if str(eff.get("effect_type", "")).upper() != "RANKING":
+                continue
+            if str(eff.get("factor_name", "")) != factor:
+                continue
+            lvl = str(eff.get("level_a", "")).strip()
+            if lvl:
+                levels.add(lvl)
+    elif etype == "PAIRWISE_DIFF":
+        for eff in effect_map.values():
+            if str(eff.get("effect_type", "")).upper() != "PAIRWISE_DIFF":
+                continue
+            if str(eff.get("factor_name", "")) != factor:
+                continue
+            a = str(eff.get("level_a", "")).strip()
+            b = str(eff.get("level_b", "")).strip()
+            if a:
+                levels.add(a)
+            if b:
+                levels.add(b)
+    else:
+        return None
+
+    return len(levels) if levels else None
+
+
 def _build_lineage_mock(stability: dict[str, Any] | None) -> dict[str, Any]:
     if not stability:
         return {"group_headers": [], "rows": []}
@@ -286,12 +349,22 @@ def _build_lineage_mock(stability: dict[str, Any] | None) -> dict[str, Any]:
         group_cells = []
         contributors = []
         group_bucket_values = []
+        fallback_snapshot: dict[str, Any] | None = None
+        fallback_interactive_path = ""
         for group_key in header_order:
+            group_effect_map = per_group_effects.get(group_key, {})
             ge = per_group_effects.get(group_key, {}).get(effect_id)
             bucket = str(ge.get("bucket", "")).strip() if ge else ""
             median = None
             iqr = None
+            primary_level_count = _primary_level_count_for_group(
+                group_effect_map,
+                effect_type=effect_type,
+                factor_name=factor_name,
+            )
             plot_path = None
+            interactive_plot_path = ""
+            snapshot = {}
             if ge and isinstance(ge.get("estimate_distribution"), dict):
                 try:
                     median = float(ge["estimate_distribution"].get("median"))
@@ -303,6 +376,12 @@ def _build_lineage_mock(stability: dict[str, Any] | None) -> dict[str, Any]:
                     iqr = None
             if ge:
                 plot_path = str(ge.get("plot_path", "") or "")
+                interactive_plot_path = str(ge.get("interactive_plot_path", "") or "")
+                snapshot = ge.get("snapshot") if isinstance(ge.get("snapshot"), dict) else {}
+                if not fallback_snapshot and snapshot:
+                    fallback_snapshot = dict(snapshot)
+                if not fallback_interactive_path and interactive_plot_path:
+                    fallback_interactive_path = interactive_plot_path
             contributes = bool(ge)
             if bucket:
                 group_bucket_values.append(bucket)
@@ -313,7 +392,11 @@ def _build_lineage_mock(stability: dict[str, Any] | None) -> dict[str, Any]:
                 "bucket_tooltip": _bucket_tooltip(bucket) if bucket else "",
                 "median": median,
                 "iqr": iqr,
+                "primary_level_count": primary_level_count,
                 "plot_path": plot_path,
+                "interactive_plot_path": interactive_plot_path,
+                "snapshot": snapshot,
+                "snapshot_digest": _snapshot_digest(snapshot, bucket),
                 "contributes": contributes,
                 "weight_normalized": float(weights.get("weight_normalized", 0.0)),
                 "weight_raw": float(weights.get("weight_raw", 0.0)),
@@ -324,7 +407,25 @@ def _build_lineage_mock(stability: dict[str, Any] | None) -> dict[str, Any]:
             group_cells.append(cell)
             contributors.append(cell)
 
+        contributing_cells = [c for c in contributors if bool(c.get("contributes"))]
+        contributing_weight_sum = float(sum(float(c.get("weight_normalized", 0.0)) for c in contributing_cells))
+        equal_share = (1.0 / len(contributing_cells)) if contributing_cells else 0.0
+        for cell in contributors:
+            if not bool(cell.get("contributes")):
+                cell["effect_weight_normalized"] = 0.0
+                continue
+            base_weight = float(cell.get("weight_normalized", 0.0))
+            if contributing_weight_sum > 0:
+                cell["effect_weight_normalized"] = base_weight / contributing_weight_sum
+            else:
+                cell["effect_weight_normalized"] = equal_share
+
         tag, note = _lineage_tag(combined_bucket or None, group_bucket_values)
+        combined_snapshot = combined.get("snapshot") if isinstance(combined, dict) and isinstance(combined.get("snapshot"), dict) else {}
+        row_snapshot = combined_snapshot or fallback_snapshot or {}
+        combined_interactive = (
+            str(combined.get("interactive_plot_path", "") or "") if isinstance(combined, dict) else ""
+        ) or fallback_interactive_path
         rows.append(
             {
                 "recipe_id": f"lineage_recipe_{idx}",
@@ -336,6 +437,9 @@ def _build_lineage_mock(stability: dict[str, Any] | None) -> dict[str, Any]:
                 "level_b": level_b,
                 "combined_bucket": combined_bucket,
                 "combined_bucket_tooltip": _bucket_tooltip(combined_bucket) if combined_bucket else "",
+                "combined_interactive_plot_path": combined_interactive,
+                "snapshot": row_snapshot,
+                "snapshot_digest": _snapshot_digest(row_snapshot, combined_bucket),
                 "lineage_tag": tag,
                 "lineage_note": note,
                 "group_cells": group_cells,
@@ -354,6 +458,36 @@ def _build_lineage_mock(stability: dict[str, Any] | None) -> dict[str, Any]:
     }
     rows.sort(key=lambda r: (lineage_order.get(str(r.get("lineage_tag")), 99), str(r.get("effect_id", ""))))
     return {"group_headers": group_headers, "rows": rows}
+
+
+def _lineage_type_sections(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    order = {
+        "PAIRWISE_DIFF": 0,
+        "RANKING": 1,
+        "SLOPE": 2,
+        "INTERACTION_FLAG": 3,
+    }
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        key = str(row.get("effect_type", "")).strip() or "UNKNOWN"
+        grouped.setdefault(key, []).append(row)
+
+    sections: list[dict[str, Any]] = []
+    for effect_type, entries in sorted(grouped.items(), key=lambda kv: (order.get(kv[0], 99), kv[0])):
+        sections.append(
+            {
+                "effect_type": effect_type,
+                "count": len(entries),
+                "rows": entries,
+                "bucket_counts": {
+                    "STABLE": sum(1 for r in entries if str(r.get("combined_bucket", "")) == "STABLE"),
+                    "CONDITIONAL": sum(1 for r in entries if str(r.get("combined_bucket", "")) == "CONDITIONAL"),
+                    "NON_EFFECT": sum(1 for r in entries if str(r.get("combined_bucket", "")) == "NON_EFFECT"),
+                    "REDFLAG": sum(1 for r in entries if str(r.get("combined_bucket", "")) == "REDFLAG"),
+                },
+            }
+        )
+    return sections
 
 
 def _health_label(name: str) -> str:
@@ -987,6 +1121,7 @@ def stability_dashboard(analysis_id: int):
 
     stability = latest_stability(db_path, analysis_id)
     lineage_mock = _build_lineage_mock(stability) if stability else {"group_headers": [], "rows": []}
+    lineage_sections = _lineage_type_sections(lineage_mock.get("rows", []))
     return render_template(
         "stability_dashboard.html",
         analysis=analysis,
@@ -994,6 +1129,7 @@ def stability_dashboard(analysis_id: int):
         stability=stability,
         group_summary=group_summary,
         lineage_mock=lineage_mock,
+        lineage_sections=lineage_sections,
     )
 
 
